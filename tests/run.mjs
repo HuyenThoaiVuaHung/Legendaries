@@ -21,6 +21,9 @@ const results = new Map([
   ['unsafe default secrets bind', 'FAIL'],
   ['limits', 'FAIL'],
   ['room-features', 'FAIL'],
+  ['clock', 'FAIL'],
+  ['kd-flow', 'FAIL'],
+  ['concurrency', 'FAIL'],
 ]);
 let server;
 let suite;
@@ -163,6 +166,7 @@ try {
     await runSuite('rooms-api', 'rooms-api.mjs', args);
     await runSuite('security-audit', 'security-audit.mjs', [String(port)]);
     await runSuite('bank', 'bank.mjs', args);
+    await runSuite('kd-flow', 'kd-flow.mjs', [String(port)]);
     const saved = await runSuite('rooms-auth persist-create', 'rooms-auth.mjs', [...args, 'persist-create'], { capture: true });
     await stopServer();
     if (saved && !interrupted) {
@@ -221,6 +225,22 @@ try {
   } finally {
     await stopServer();
   }
+
+  try {
+    const port = await freePort();
+    await startServer(port, {
+      ...env, LEGENDARY_PORT: String(port), LEGENDARY_MULTIROOM: 'true',
+      LEGENDARY_SIGNUPRATELIMIT: '500', LEGENDARY_ROOMCREATERATELIMIT: '500',
+      LEGENDARY_ROOMJOINRATELIMIT: '5000', LEGENDARY_MAXSOCKETSPERIP: '500', LEGENDARY_MAXROOMS: '200',
+    });
+    await runSuite('concurrency', 'concurrency.mjs', [String(port)]);
+  } catch (error) {
+    console.error(`Concurrency: ${error.message}`);
+  } finally {
+    await stopServer();
+  }
+
+  await runSuite('clock', 'clock.mjs');
 
   if (!interrupted) {
     const sandbox = join(tempDir, 'isolation');

@@ -17,6 +17,10 @@ import {
 } from '../contracts/game';
 import type { Room } from '../rooms/room';
 
+const MS_PER_SECOND = 1000;
+/** Decision-window remainders are reported in tenths of a second. */
+const DECISION_STEP_MS = 100;
+
 export const STAFF_ROUND_UPDATE_EVENTS: Readonly<Record<RoundKind, string>> = {
   kd: 'update-kd-data-admin',
   vcnv: 'update-vcnv-data',
@@ -200,7 +204,11 @@ export function emitRoundUpdate(room: Room, kind: RoundKind, data: RoundData): v
 export function buildLiveStateSnapshot(room: Room, role: Role): LiveStateSnapshot {
   const now = Date.now();
   const privileged = isPrivilegedRole(role);
-  const { session, store, timer } = room;
+  const { session, store, timers } = room;
+  const kdWindow = timers.kdDecision;
+  const vdWindow = timers.vdSteal;
+  const main = timers.main;
+  const mainShown = main.isRunning() || main.isPaused() || main.status === 'pending';
 
   let activeTimedSfx = session.activeTimedSfx;
   if (
@@ -224,7 +232,13 @@ export function buildLiveStateSnapshot(room: Room, role: Role): LiveStateSnapsho
 
   return {
     serverTime: now,
-    clock: timer.snapshot(),
+    clock: {
+      running: main.isRunning(),
+      remaining: Math.ceil(main.remainingMs() / MS_PER_SECOND),
+      maxSeconds: mainShown ? main.durationMs / MS_PER_SECOND : 0,
+      paused: main.isPaused(),
+    },
+    timers: timers.snapshot(),
     activeLoopSfx: session.activeLoopSfx ? { ...session.activeLoopSfx } : null,
     activeTimedSfx: activeTimedSfx ? { ...activeTimedSfx } : null,
     kd: {
@@ -238,8 +252,9 @@ export function buildLiveStateSnapshot(room: Room, role: Role): LiveStateSnapsho
       buzzerOpen: session.kdBuzzerOpen,
       maxQuestionCount: session.kdMaxQuestionCount,
       currentQuestionNo: session.kdCurrentQuestionNo,
-      decisionTimerOwner: session.kdDecisionTimerOwner,
-      decisionRemaining: session.kdDecisionRemaining,
+      decisionTimerOwner: kdWindow.isLive() ? (kdWindow.owner ?? 'none') : 'none',
+      decisionRemaining: Math.ceil(kdWindow.remainingMs() / DECISION_STEP_MS),
+      flow: room.kdFlow.state(),
     },
     vcnv: {
       question: vcnvRaw ? (privileged ? vcnvRaw : sanitizeVcnvQuestion(vcnvRaw)) : null,
@@ -263,7 +278,7 @@ export function buildLiveStateSnapshot(room: Room, role: Role): LiveStateSnapsho
         : null,
       stealingPlayerIndex: session.vdStealingPlayerIndex,
       stealWindowOpen: session.vdStealWindowOpen,
-      stealRemaining: session.vdStealRemaining,
+      stealRemaining: Math.ceil(vdWindow.remainingMs() / DECISION_STEP_MS),
       videoPlaying: session.vdVideo.playing,
       videoStartedAt: session.vdVideo.startedAt,
       video: { ...session.vdVideo },

@@ -103,5 +103,64 @@ check('single venue viewer session', viewerSession.status === 200 && viewerSessi
 const adminSession = await json('/api/session', { headers: { authorization: `Bearer ${admin.body.token}` } });
 check('single venue admin session', adminSession.status === 200 && adminSession.body.roleId === 1);
 
+// --- Socket: clock protocol ---------------------------------------------
+const adminSock = io(base, { auth: { token: admin.body?.token }, transports: ['websocket'] });
+const playerSock = io(base, { auth: { token: player.body?.token }, transports: ['websocket'] });
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+await Promise.all([adminSock, playerSock].map((s) => new Promise((resolve) => s.once('connect', resolve))));
+const clockViews = [];
+const sfxPlays = [];
+let ttRound = null;
+adminSock.on('clock-state', (view) => { if (view.id === 'main') clockViews.push(view); });
+adminSock.on('play-sfx', (code) => sfxPlays.push(code));
+adminSock.on('update-tangtoc-data', (data) => { ttRound = data; });
+
+const syncAck = await new Promise((resolve) => {
+  const sentAt = Date.now();
+  adminSock.timeout(2000).emit('time-sync', sentAt, (err, serverNow) => resolve(err ? null : serverNow));
+});
+check('time-sync ack returns server epoch', typeof syncAck === 'number' && Math.abs(syncAck - Date.now()) < 5000, String(syncAck));
+
+await json('/api/match/position', { method: 'PATCH', headers: adminAuth, body: JSON.stringify({ position: 'TT_Q' }) });
+const ttData = await json('/api/rounds/tt', { headers: adminAuth });
+if (ttData.body?.questions?.length) adminSock.emit('broadcast-tt-question', ttData.body.questions[0].id);
+await wait(150);
+
+adminSock.emit('start-clock', 10);
+adminSock.emit('play-sfx', 'TT_10S');
+await wait(60);
+check('start-clock emits pending clock-state', clockViews.at(-1)?.status === 'pending' && clockViews.at(-1).durationMs === 10000, JSON.stringify(clockViews.at(-1)));
+await wait(1100);
+check('clock-state turns running after delay', clockViews.at(-1)?.status === 'running');
+check('TT start sets timerStartTimestamp to clock startsAt', ttRound?.timerStartTimestamp === clockViews[0]?.startsAt, `${ttRound?.timerStartTimestamp} vs ${clockViews[0]?.startsAt}`);
+await wait(100);
+check('TT_10S plays exactly once despite client relay', sfxPlays.filter((c) => c === 'TT_10S').length === 1, JSON.stringify(sfxPlays));
+adminSock.emit('play-pause-clock');
+await wait(100);
+const paused = clockViews.at(-1);
+check('pause reports paused with exact remainder', paused?.status === 'paused' && paused.remainingMs > 0 && paused.remainingMs < paused.durationMs, JSON.stringify(paused));
+adminSock.emit('play-pause-clock');
+await wait(100);
+check('resume reports running', clockViews.at(-1)?.status === 'running');
+const seqs = clockViews.map((v) => v.seq);
+check('clock-state seq strictly increases', seqs.length >= 4 && seqs.every((s, i) => i === 0 || s > seqs[i - 1]), JSON.stringify(seqs));
+adminSock.emit('start-clock', 1);
+await wait(2300);
+check('clock expires', clockViews.at(-1)?.status === 'expired');
+
+adminSock.emit('start-clock', 1);
+await wait(2100);
+playerSock.emit('player-submit-answer-tangtoc', 'LATE_BUT_GRACED');
+await wait(150);
+const graced = (await json('/api/rounds/tt', { headers: adminAuth })).body?.playerAnswers?.[0];
+check('late TT answer inside grace window is accepted with elapsedMs', graced?.answer === 'LATE_BUT_GRACED' && typeof graced.elapsedMs === 'number', JSON.stringify(graced));
+await wait(400);
+playerSock.emit('player-submit-answer-tangtoc', 'TOO_LATE');
+await wait(150);
+const rejected = (await json('/api/rounds/tt', { headers: adminAuth })).body?.playerAnswers?.[0];
+check('TT answer after grace window is rejected', rejected?.answer === 'LATE_BUT_GRACED', JSON.stringify(rejected));
+adminSock.close();
+playerSock.close();
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

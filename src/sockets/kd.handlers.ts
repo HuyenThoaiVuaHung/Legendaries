@@ -1,14 +1,9 @@
 import { Role } from '../contracts/api';
-import { KdQuestion } from '../contracts/game';
+import { KdMarkCommand, KdMarkRejected, KdQuestion, KdVerdict } from '../contracts/game';
 import { LogLevel } from '../logger';
 import { sanitizeKdQuestion } from '../services/round-view';
-import { DecisionTimerOwner, NO_PLAYER } from '../state/game.state';
+import { NO_PLAYER } from '../state/game.state';
 import { HandlerContext, isAdmin, isStaff, safeOn } from './context';
-
-// Sound-effect identifiers understood by the frontend (protocol vocabulary,
-// names kept from the old client).
-const SFX_GET_TURN = 'KD_GET_TURN';
-const SFX_WRONG = 'KD_WRONG';
 
 /** Player index of the acting socket, or NO_PLAYER when it isn't a player. */
 function resolvePlayerIndex(ctx: HandlerContext): number {
@@ -28,9 +23,33 @@ function isKdQuestion(value: unknown): value is KdQuestion {
   );
 }
 
+function isInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value);
+}
+
 export function registerKdHandlers(ctx: HandlerContext): void {
-  const { io, room, socket, store, session, timer, log, rules } = ctx;
+  const { io, room, socket, store, session, timers, log, rules } = ctx;
   const kd = store.round('kd');
+  const flow = room.kdFlow;
+
+  /** Mark payload; clients that send none are graded against the current state. */
+  const parseMark = (raw: unknown): KdMarkCommand | null => {
+    if (raw === undefined || raw === null) return { questionSeq: flow.questionSeq, playerIndex: session.kdTurnPlayerIndex };
+    const cmd = raw as Partial<KdMarkCommand>;
+    return isInt(cmd.questionSeq) && isInt(cmd.playerIndex) ? { questionSeq: cmd.questionSeq, playerIndex: cmd.playerIndex } : null;
+  };
+
+  const reject = (reason: KdMarkRejected['reason']): void => {
+    const rejected: KdMarkRejected = { reason, questionSeq: flow.questionSeq, turnPlayerIndex: session.kdTurnPlayerIndex };
+    socket.emit('kd-mark-rejected', rejected);
+  };
+
+  const markMultiplayer = (verdict: KdVerdict, raw: unknown): void => {
+    const cmd = parseMark(raw);
+    if (!cmd) return;
+    const reason = flow.mark(verdict, cmd);
+    if (reason) reject(reason);
+  };
 
   const emitQuestionNumbers = (): void => {
     io.emit(
@@ -54,14 +73,18 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     });
   };
 
-  safeOn(ctx, 'broadcast-kd-question', (question: unknown) => {
+  safeOn(ctx, 'broadcast-kd-question', (question: unknown, replacesSeq?: unknown) => {
     if (!isStaff(ctx)) return;
     if (!isKdQuestion(question)) return;
+    const multiplayer = flow.isMultiplayer();
+    // Several admins may auto-advance after one grade; only the first lands.
+    if (multiplayer && isInt(replacesSeq) && replacesSeq !== flow.questionSeq) return;
     session.kdPreviousAnswer = session.kdCurrentQuestion?.answer || null;
     session.kdCurrentQuestion = question;
     session.kdTurnPlayerIndex = NO_PLAYER;
     socket.to(`${room.id}:staff`).emit('update-kd-question', question);
     socket.to(`${room.id}:public`).emit('update-kd-question', sanitizeKdQuestion(question));
+    if (multiplayer) flow.beginQuestion();
   });
 
   safeOn(ctx, 'clear-question-kd', () => {
@@ -70,28 +93,27 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     session.kdCurrentQuestion = null;
     session.kdTurnPlayerIndex = NO_PLAYER;
     socket.to(room.id).emit('update-kd-question', {});
+    if (flow.isMultiplayer()) flow.reset();
   });
 
   safeOn(ctx, 'get-turn-kd', () => {
     const playerIndex = resolvePlayerIndex(ctx);
     if (playerIndex === NO_PLAYER) return;
-    if (kd.get().gamemode !== 'M' || !session.kdBuzzerOpen) return;
+    if (kd.get().gamemode !== 'M') return;
+    if (flow.buzz(playerIndex)) return;
     if (session.kdTurnPlayerIndex !== NO_PLAYER) {
       // First buzz wins; late presses are only logged.
       log(`Player ${playerIndex} requested turn`);
-      return;
     }
-    io.emit('play-sfx', SFX_GET_TURN);
-    session.kdDecisionTimerOwner = DecisionTimerOwner.Player;
-    session.kdTurnPlayerIndex = playerIndex;
-    session.kdBuzzerOpen = false;
-    io.emit('disable-answer-button-kd');
-    io.emit('player-got-turn-kd', playerIndex);
   });
 
   safeOn(ctx, 'clear-turn-kd', () => {
     if (!isStaff(ctx)) return;
     log('Cleared turn khoi dong');
+    if (flow.isMultiplayer()) {
+      flow.restartBuzzWindow();
+      return;
+    }
     session.kdTurnPlayerIndex = NO_PLAYER;
     session.kdBuzzerOpen = true;
     io.emit('clear-turn-player-kd');
@@ -100,13 +122,18 @@ export function registerKdHandlers(ctx: HandlerContext): void {
 
   safeOn(ctx, 'clear-turn-kd-f', () => {
     if (!isStaff(ctx)) return;
+    if (flow.isMultiplayer()) flow.freezeAnswer();
     session.kdTurnPlayerIndex = NO_PLAYER;
     session.kdBuzzerOpen = false;
     io.emit('clear-turn-player-kd');
   });
 
-  safeOn(ctx, 'correct-mark-kd', () => {
+  safeOn(ctx, 'correct-mark-kd', (raw?: unknown) => {
     if (!isAdmin(ctx)) return;
+    if (flow.isMultiplayer()) {
+      markMultiplayer('correct', raw);
+      return;
+    }
     session.kdBuzzerOpen = true;
     io.emit('enable-answer-button-kd');
     session.kdCurrentQuestionNo += 1;
@@ -132,12 +159,16 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     }
 
     io.emit('update-match-data', store.getMatch());
-    session.kdDecisionTimerOwner = DecisionTimerOwner.None;
     session.kdTurnPlayerIndex = NO_PLAYER;
+    timers.stopKdDecision();
   });
 
-  safeOn(ctx, 'wrong-mark-kd', () => {
+  safeOn(ctx, 'wrong-mark-kd', (raw?: unknown) => {
     if (!isAdmin(ctx)) return;
+    if (flow.isMultiplayer()) {
+      markMultiplayer('wrong', raw);
+      return;
+    }
     session.kdBuzzerOpen = true;
     io.emit('enable-answer-button-kd');
 
@@ -151,8 +182,19 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     log(`Current question no: ${session.kdCurrentQuestionNo}`);
     emitQuestionNumbers();
     io.emit('update-match-data', store.getMatch());
-    session.kdDecisionTimerOwner = DecisionTimerOwner.None;
     session.kdTurnPlayerIndex = NO_PLAYER;
+    timers.stopKdDecision();
+  });
+
+  safeOn(ctx, 'no-answer-kd', (raw?: unknown) => {
+    if (!isAdmin(ctx) || !flow.isMultiplayer()) return;
+    markMultiplayer('noAnswer', raw);
+  });
+
+  safeOn(ctx, 'undo-mark-kd', () => {
+    if (!isAdmin(ctx) || !flow.isMultiplayer()) return;
+    const reason = flow.undo();
+    if (reason) reject(reason);
   });
 
   safeOn(ctx, 'stop-kd-sound', () => {
@@ -179,81 +221,36 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     session.kdCurrentQuestion = null;
     session.kdPreviousAnswer = null;
     session.kdTurnPlayerIndex = NO_PLAYER;
-    session.kdDecisionRemaining = 0;
-    session.kdBuzzerOpen = true;
     emitQuestionNumbers();
-    io.emit('enable-answer-button-kd');
+    if (flow.isMultiplayer()) {
+      flow.reset();
+    } else {
+      session.kdBuzzerOpen = true;
+      io.emit('enable-answer-button-kd');
+    }
     io.emit('update-questions-number-kd', questionCount);
   });
 
-  // Post-buzz decision window: rules.kdDecisionTicks × rules.decisionTickMs.
-  // Expiry of either variant only plays the wrong cue; the admin marks the
-  // answer or skips the question manually.
+  // Post-buzz decision window (rules.kdDecisionMs). Expiry only plays the
+  // wrong cue; the admin marks the answer or skips the question manually.
   safeOn(ctx, 'start-3s-timer-kd', (isPlayerTimer: unknown) => {
     if (!isStaff(ctx)) return;
     if (typeof isPlayerTimer !== 'boolean') return;
-    if (session.kdDecisionCountdown !== undefined) clearInterval(session.kdDecisionCountdown);
-    let counter = rules.kdDecisionTicks;
-    session.kdDecisionRemaining = counter;
-    session.kdDecisionTimerOwner = isPlayerTimer
-      ? DecisionTimerOwner.Player
-      : DecisionTimerOwner.Admin;
-    io.emit('update-3s-timer-kd', counter, isPlayerTimer);
-
-    const handle = setInterval(() => {
-      counter -= 1;
-      session.kdDecisionRemaining = Math.max(counter, 0);
-      io.emit('update-3s-timer-kd', counter, isPlayerTimer);
-
-      if (isPlayerTimer) {
-        if (session.kdDecisionTimerOwner === DecisionTimerOwner.None) {
-          clearInterval(handle);
-          session.kdDecisionRemaining = 0;
-          if (timer.remainingSeconds() > 0) {
-            session.kdBuzzerOpen = true;
-            io.emit('enable-answer-button-kd');
-          }
-          session.kdTurnPlayerIndex = NO_PLAYER;
-          io.emit('update-3s-timer-kd', 0, true);
-          io.emit('update-3s-timer-kd', 0, false);
-        } else if (counter === 0) {
-          clearInterval(handle);
-          session.kdDecisionRemaining = 0;
-          if (timer.remainingSeconds() > 0) {
-            session.kdBuzzerOpen = true;
-            io.emit('enable-answer-button-kd');
-          }
-          if (session.kdDecisionTimerOwner === DecisionTimerOwner.Player) {
-            session.kdDecisionTimerOwner = DecisionTimerOwner.None;
-            io.emit('update-match-data', store.getMatch());
-            io.emit('play-sfx', SFX_WRONG);
-            emitQuestionNumbers();
-          }
-        }
-      } else {
-        if (counter === 0) {
-          clearInterval(handle);
-          session.kdDecisionRemaining = 0;
-          session.kdDecisionTimerOwner = DecisionTimerOwner.None;
-          if (timer.remainingSeconds() > 0) {
-            session.kdBuzzerOpen = true;
-            io.emit('enable-answer-button-kd');
-          }
-          io.emit('play-sfx', SFX_WRONG);
-          emitQuestionNumbers();
-        } else if (session.kdDecisionTimerOwner !== DecisionTimerOwner.Admin) {
-          clearInterval(handle);
-          session.kdDecisionRemaining = 0;
-          io.emit('update-3s-timer-kd', 0, false);
-        }
-      }
-    }, rules.decisionTickMs);
-    session.kdDecisionCountdown = handle;
+    // Multiplayer: the server runs the windows; this is only a legacy nudge.
+    if (flow.isMultiplayer()) {
+      if (isPlayerTimer) flow.resumeAnswer();
+      else flow.restartBuzzWindow();
+      return;
+    }
+    timers.startKdDecision(isPlayerTimer);
   });
 
   safeOn(ctx, 'stop-3s-timer-kd', () => {
     if (!isStaff(ctx)) return;
-    session.kdDecisionTimerOwner = DecisionTimerOwner.None;
-    session.kdDecisionRemaining = 0;
+    if (flow.isMultiplayer()) {
+      flow.freezeAnswer();
+      return;
+    }
+    timers.stopKdDecision();
   });
 }

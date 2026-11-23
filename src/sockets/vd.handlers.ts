@@ -15,15 +15,15 @@ function resolvePlayerIndex(ctx: HandlerContext): number {
 }
 
 export function registerVdHandlers(ctx: HandlerContext): void {
-  const { io, room, store, session, log, rules } = ctx;
+  const { io, room, store, session, timers, log, rules } = ctx;
   const vd = store.round('vd');
 
   safeOn(ctx, 'broadcast-vd-question', (id: unknown) => {
     if (!isStaff(ctx)) return;
     if (typeof id !== 'number' || !Number.isInteger(id)) return;
     session.vdHopeStarPenalized = false;
+    timers.stopVdSteal();
     session.vdStealWindowOpen = false;
-    session.vdStealRemaining = 0;
     session.vdStealingPlayerIndex = NO_PLAYER;
     const resetVideo = session.resetVideoPlayback('vd');
     io.emit('video-state', { target: 'vd', state: resetVideo, serverTime: Date.now() });
@@ -85,6 +85,7 @@ export function registerVdHandlers(ctx: HandlerContext): void {
     });
     session.vdStealingPlayerIndex = NO_PLAYER;
     session.vdStealWindowOpen = false;
+    timers.stopVdSteal();
     session.vdHopeStarPenalized = false;
     emitRoundUpdate(room, 'vd', updated);
     io.emit('update-match-data', match);
@@ -110,6 +111,7 @@ export function registerVdHandlers(ctx: HandlerContext): void {
     });
     session.vdStealingPlayerIndex = NO_PLAYER;
     session.vdStealWindowOpen = false;
+    timers.stopVdSteal();
     session.vdHopeStarPenalized = false;
     emitRoundUpdate(room, 'vd', updated);
     io.emit('update-match-data', match);
@@ -125,6 +127,7 @@ export function registerVdHandlers(ctx: HandlerContext): void {
     io.emit('lock-button-vd');
     session.vdStealingPlayerIndex = playerIndex;
     session.vdStealWindowOpen = false;
+    timers.vdSteal.stop();
     io.emit('player-steal-question', playerIndex);
   });
 
@@ -144,8 +147,6 @@ export function registerVdHandlers(ctx: HandlerContext): void {
 
   safeOn(ctx, 'start-5s-countdown-vd', () => {
     if (!isStaff(ctx)) return;
-    let counter = rules.vdStealTicks;
-    session.vdStealRemaining = counter;
     session.vdStealWindowOpen = true;
     io.emit('unlock-button-vd');
 
@@ -163,21 +164,6 @@ export function registerVdHandlers(ctx: HandlerContext): void {
       io.emit('update-match-data', match);
     }
 
-    io.emit('update-5s-countdown-vd', counter);
-    if (session.vdStealCountdown !== undefined) clearInterval(session.vdStealCountdown);
-    const handle = setInterval(() => {
-      counter -= 1;
-      session.vdStealRemaining = Math.max(counter, 0);
-      io.emit('update-5s-countdown-vd', counter);
-      if (counter <= 0 || !session.vdStealWindowOpen) {
-        clearInterval(handle);
-        if (session.vdStealCountdown === handle) session.vdStealCountdown = undefined;
-        session.vdStealWindowOpen = false;
-        session.vdStealRemaining = 0;
-        io.emit('update-5s-countdown-vd', 0);
-        io.emit('lock-button-vd');
-      }
-    }, rules.decisionTickMs);
-    session.vdStealCountdown = handle;
+    timers.startVdSteal();
   });
 }

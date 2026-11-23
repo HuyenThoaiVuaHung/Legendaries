@@ -30,7 +30,9 @@ function formatReadableTime(timestamp: number): string {
   );
 }
 
-function byTimestamp(a: TtAnswer, b: TtAnswer): number {
+/** Server-measured elapsed time when both have it, else arrival timestamp. */
+function byRank(a: TtAnswer, b: TtAnswer): number {
+  if (a.elapsedMs !== undefined && b.elapsedMs !== undefined) return a.elapsedMs - b.elapsedMs;
   return a.timestamp - b.timestamp;
 }
 
@@ -46,7 +48,7 @@ function resolvePlayerIndex(ctx: HandlerContext): number {
 }
 
 export function registerTtHandlers(ctx: HandlerContext): void {
-  const { io, room, socket, store, timer, log, rules } = ctx;
+  const { io, room, socket, store, timers, log, rules } = ctx;
   const tt = store.round('tt');
 
   safeOn(ctx, 'player-submit-answer-tangtoc', (answer: unknown) => {
@@ -56,10 +58,11 @@ export function registerTtHandlers(ctx: HandlerContext): void {
       return;
     }
     if (typeof answer !== 'string' || answer.length > 500) return;
+    const arrival = room.time.mono();
     const position = store.getMatch().position;
     const current = tt.get();
     if (
-      !timer.isRunning() ||
+      !timers.main.acceptsAt(arrival, rules.submissionGraceMs) ||
       current.showResults ||
       current.showAnswer ||
       position === 'TT_A' ||
@@ -68,10 +71,12 @@ export function registerTtHandlers(ctx: HandlerContext): void {
       return;
     }
     const timestamp = Date.now();
+    const elapsedMs = Math.round(timers.main.activeElapsedMs(arrival));
     const data = tt.update((d) => {
       const entry = d.playerAnswers[playerIndex];
       if (!entry) return;
       entry.answer = answer;
+      entry.elapsedMs = elapsedMs;
       entry.timestamp = timestamp;
       entry.readableTime = formatReadableTime(timestamp);
     });
@@ -82,28 +87,31 @@ export function registerTtHandlers(ctx: HandlerContext): void {
 
   safeOn(ctx, 'update-timer-start-timestamp', () => {
     if (!isAdmin(ctx)) return;
+    // Legacy: the server now stamps this itself in 'start-clock'.
+    const startsAt = timers.main.startsAtMono;
+    if (!timers.main.isLive() || startsAt === null) return;
     const data = tt.update((d) => {
-      d.timerStartTimestamp = Date.now() + rules.mainClockTickMs;
+      d.timerStartTimestamp = room.time.epoch(startsAt);
     });
     emitRoundUpdate(room, 'tt', data);
   });
 
   safeOn(ctx, 'submit-mark-tangtoc-admin', () => {
     if (!isAdmin(ctx)) return;
-    const ranked = [...tt.get().playerAnswers].sort(byTimestamp);
+    const ranked = [...tt.get().playerAnswers].sort(byRank);
     const match = store.updateMatch((m) => {
       let placement = 0;
-      let lastTimestamp: number | null = null;
+      let last: TtAnswer | null = null;
       let lastPoints = 0;
       for (const answer of ranked) {
         if (answer.correct !== true) continue;
         const player = m.players[answer.playerIndex];
         if (!player) continue;
         const points =
-          lastTimestamp !== null && answer.timestamp === lastTimestamp
+          last !== null && byRank(last, answer) === 0
             ? lastPoints
             : (rules.ttPointsByPlacement[placement] ?? 0);
-        lastTimestamp = answer.timestamp;
+        last = answer;
         lastPoints = points;
         player.score += points;
         log(`Player ${player.name} got ${points} points`);

@@ -32,7 +32,9 @@ function formatReadableTime(timestamp: number): string {
   );
 }
 
-function byTimestamp(a: ObstacleBuzz, b: ObstacleBuzz): number {
+/** Server-measured elapsed time when both have it, else arrival timestamp. */
+function byRank(a: ObstacleBuzz, b: ObstacleBuzz): number {
+  if (a.elapsedMs !== undefined && b.elapsedMs !== undefined) return a.elapsedMs - b.elapsedMs;
   return a.timestamp - b.timestamp;
 }
 
@@ -57,7 +59,7 @@ function isValidRowId(questionId: unknown, count: number): questionId is number 
 }
 
 export function registerVcnvHandlers(ctx: HandlerContext): void {
-  const { io, room, socket, store, timer, log, rules } = ctx;
+  const { io, room, socket, store, timers, log, rules } = ctx;
   const vcnv = store.round('vcnv');
 
   safeOn(ctx, 'mark-answer-vcnv', (marks: unknown) => {
@@ -102,9 +104,10 @@ export function registerVcnvHandlers(ctx: HandlerContext): void {
       return;
     }
     if (typeof answer !== 'string' || answer.length > 500) return;
+    const arrival = room.time.mono();
     const position = store.getMatch().position;
     const current = vcnv.get();
-    if (!timer.isRunning() || current.showResults || position === 'VCNV_A') return;
+    if (!timers.main.acceptsAt(arrival, rules.submissionGraceMs) || current.showResults || position === 'VCNV_A') return;
     if (current.disabledPlayers.includes(playerIndex)) return;
     const data = vcnv.update((d) => {
       if (d.playerAnswers[playerIndex]) d.playerAnswers[playerIndex].answer = answer;
@@ -138,9 +141,10 @@ export function registerVcnvHandlers(ctx: HandlerContext): void {
       log(`Socket ${socket.id} tried to clear a VCNV answer but is not a player`, LogLevel.Error);
       return;
     }
+    const arrival = room.time.mono();
     const position = store.getMatch().position;
     const current = vcnv.get();
-    if (!timer.isRunning() || current.showResults || position === 'VCNV_A') return;
+    if (!timers.main.acceptsAt(arrival, rules.submissionGraceMs) || current.showResults || position === 'VCNV_A') return;
     if (current.disabledPlayers.includes(playerIndex)) return;
     const data = vcnv.update((d) => {
       if (!d.playerAnswers[playerIndex]) return;
@@ -197,11 +201,12 @@ export function registerVcnvHandlers(ctx: HandlerContext): void {
       playerIndex,
       timestamp,
       readableTime: formatReadableTime(timestamp),
+      ...(timers.main.isRunning() ? { elapsedMs: Math.round(timers.main.activeElapsedMs()) } : {}),
     };
     const data = vcnv.update((d) => {
       d.disabledPlayers.push(playerIndex);
       d.obstacleBuzzes.push(buzz);
-      d.obstacleBuzzes.sort(byTimestamp);
+      d.obstacleBuzzes.sort(byRank);
     });
     emitRoundUpdate(room, 'vcnv', data);
   });

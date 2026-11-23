@@ -4,7 +4,7 @@ import { GameRules } from '../game.rules';
 import { LogFn, LogLevel } from '../logger';
 import { GameSessionState } from '../state/game.state';
 import { MatchStore } from '../state/match.store';
-import { TimerService } from '../services/timer.service';
+import type { RoomTimers } from '../time/room-timers';
 import type { Room, RoomChannel } from '../rooms/room';
 
 /** Set on every socket by the auth handshake middleware in sockets/index.ts. */
@@ -30,7 +30,7 @@ export interface HandlerContext {
   identity: SocketIdentity;
   store: MatchStore;
   session: GameSessionState;
-  timer: TimerService;
+  timers: RoomTimers;
   rules: GameRules;
   log: LogFn;
   isSessionAlive: () => boolean;

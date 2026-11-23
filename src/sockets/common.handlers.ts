@@ -1,7 +1,9 @@
 import { VideoControlAction, VideoControlCommand, VideoStateUpdate, VideoTarget } from '../contracts/game';
-import { buildLiveStateSnapshot } from '../services/round-view';
+import { buildLiveStateSnapshot, emitRoundUpdate } from '../services/round-view';
+import { clockRoundOf, TIMED_SFX_DURATIONS_MS } from '../time/clock.policies';
 import { HandlerContext, isAdmin, isStaff, safeOn } from './context';
 
+const MS_PER_SECOND = 1000;
 const VIDEO_TARGETS: readonly VideoTarget[] = ['tt', 'vd'];
 const VIDEO_ACTIONS: readonly VideoControlAction[] = [
   'play',
@@ -14,26 +16,12 @@ const VIDEO_ACTIONS: readonly VideoControlAction[] = [
   'fullscreen',
 ];
 
-/** Nominal durations for timed countdown SFX so reconnecting clients can seek and resume. */
-const TIMED_SFX_DURATIONS_MS: Readonly<Record<string, number>> = {
-  KD_60S: 60_000,
-  KD_90S: 90_000,
-  VCNV_15S: 15_000,
-  TT_10S: 10_000,
-  TT_20S: 20_000,
-  TT_30S: 30_000,
-  TT_40S: 40_000,
-  VD_5S: 5_000,
-  VD_15S: 15_000,
-  VD_20S: 20_000,
-};
-
 /**
  * Match-wide realtime events that belong to no single round: starting the
  * match, driving the main clock, relaying sound effects, and live-state sync.
  */
 export function registerCommonHandlers(ctx: HandlerContext): void {
-  const { io, room, socket, identity, store, session, timer, rules } = ctx;
+  const { io, room, socket, identity, store, session, timers } = ctx;
 
   safeOn(ctx, 'request-live-state', () => {
     socket.emit('live-state', buildLiveStateSnapshot(room, identity.roleId));
@@ -47,30 +35,53 @@ export function registerCommonHandlers(ctx: HandlerContext): void {
     socket.to(room.id).emit('beginMatch');
   });
 
+  // Atomic: the server picks the real start instant, starts the clock, and
+  // schedules the round's countdown SFX (and the TT start stamp) against it.
   safeOn(ctx, 'start-clock', (seconds: unknown) => {
     if (!isStaff(ctx)) return;
     if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0 || seconds > 3600) return;
-    store.updateMatch((match) => {
-      match.pausedTimerSeconds = 0;
-    });
-    session.kdBuzzerOpen = true;
-    io.emit('enable-answer-button-kd');
-    timer.startMainClock(seconds, { startDelayMs: rules.kdClockStartDelayMs });
+    // Multiplayer KD opens the buzzer itself, per question.
+    if (!room.kdFlow.isMultiplayer()) {
+      session.kdBuzzerOpen = true;
+      io.emit('enable-answer-button-kd');
+    }
+    const position = store.getMatch().position;
+    const startsAtMono = timers.startMain(seconds, timers.startDelayFor(position));
+    const startsAt = room.time.epoch(startsAtMono);
+
+    const code = timers.sfxCodeFor(position, seconds);
+    if (code) {
+      session.activeTimedSfx = { code, loop: false, startedAt: startsAt, durationMs: seconds * MS_PER_SECOND };
+      timers.playSfxAt(code, startsAtMono);
+    }
+    if (clockRoundOf(position) === 'TT') {
+      const data = store.round('tt').update((d) => {
+        d.timerStartTimestamp = startsAt;
+      });
+      emitRoundUpdate(room, 'tt', data);
+    }
   });
 
   safeOn(ctx, 'play-pause-clock', () => {
     if (!isStaff(ctx)) return;
-    timer.togglePause();
+    timers.togglePause();
+  });
+
+  safeOn(ctx, 'time-sync', (_clientSentAt: unknown, ack: unknown) => {
+    if (typeof ack !== 'function') return;
+    ack(room.time.epoch());
   });
 
   safeOn(ctx, 'play-sfx', (sfx: unknown, loop?: unknown) => {
     if (!isStaff(ctx)) return;
     if (typeof sfx !== 'string' || sfx.length === 0 || sfx.length > 100) return;
     const isLoop = loop === true;
+    const timed = TIMED_SFX_DURATIONS_MS[sfx] !== undefined;
+    if (!isLoop && timed && timers.isDuplicateClientSfx(sfx)) return;
     const now = Date.now();
     if (isLoop) {
       session.activeLoopSfx = { code: sfx, loop: true, startedAt: now };
-    } else if (TIMED_SFX_DURATIONS_MS[sfx] !== undefined) {
+    } else if (timed) {
       session.activeTimedSfx = {
         code: sfx,
         loop: false,

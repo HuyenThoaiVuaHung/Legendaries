@@ -22,13 +22,6 @@ function createVideoState(muted: boolean): VideoPlaybackState {
   };
 }
 
-/** Which kind of post-buzz decision timer is running. */
-export enum DecisionTimerOwner {
-  None = 'none',
-  Admin = 'admin',
-  Player = 'player',
-}
-
 /**
  * Ephemeral per-match session state: everything that lives only while the
  * server runs and is never persisted. One instance per room.
@@ -44,15 +37,11 @@ export class GameSessionState {
   /** KD: player index currently holding the buzzer turn. */
   kdTurnPlayerIndex = NO_PLAYER;
   kdBuzzerOpen = false;
-  kdDecisionTimerOwner = DecisionTimerOwner.None;
-  kdDecisionRemaining = 0;
   kdMaxQuestionCount = 0;
   kdCurrentQuestionNo = 0;
   /** KD: question currently on screen and the previous question's answer. */
   kdCurrentQuestion: KdQuestion | null = null;
   kdPreviousAnswer: string | null = null;
-  /** KD: handle of the running post-buzz decision countdown, if any. */
-  kdDecisionCountdown?: NodeJS.Timeout;
 
   /** VCNV: currently broadcast/highlighted 1-based row id, if any. */
   vcnvCurrentQuestionId: number | null = null;
@@ -64,13 +53,10 @@ export class GameSessionState {
   /** VD: player index that pressed the steal button. */
   vdStealingPlayerIndex = NO_PLAYER;
   vdStealWindowOpen = false;
-  vdStealRemaining = 0;
   vdHopeStarPenalized = false;
   /** VD: the question currently on screen, set by 'broadcast-vd-question'. */
   vdCurrentQuestion?: VdQuestion;
   vdVideo: VideoPlaybackState = createVideoState(false);
-  /** VD: handle of the running steal-window countdown, if any. */
-  vdStealCountdown?: NodeJS.Timeout;
 
   /** CHP: player index holding the tiebreak turn. */
   chpTurnPlayerIndex = NO_PLAYER;
@@ -148,16 +134,6 @@ export class GameSessionState {
         break;
     }
     return { ...v };
-  }
-
-  /** Stop every countdown this session owns, without emitting anything. */
-  clearTimers(): void {
-    if (this.kdDecisionCountdown !== undefined) clearInterval(this.kdDecisionCountdown);
-    if (this.vdStealCountdown !== undefined) clearInterval(this.vdStealCountdown);
-    this.kdDecisionCountdown = undefined;
-    this.vdStealCountdown = undefined;
-    this.kdDecisionRemaining = 0;
-    this.vdStealRemaining = 0;
   }
 
   playerIndexOf(socketId: string): number {

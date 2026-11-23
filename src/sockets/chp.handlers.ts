@@ -19,7 +19,7 @@ function resolvePlayerIndex(ctx: HandlerContext): number {
 }
 
 export function registerChpHandlers(ctx: HandlerContext): void {
-  const { io, room, socket, store, session, timer, rules } = ctx;
+  const { io, room, socket, store, session, timers, rules } = ctx;
   const chp = store.round('chp');
 
   safeOn(ctx, 'broadcast-chp-question', (id: unknown) => {
@@ -42,12 +42,12 @@ export function registerChpHandlers(ctx: HandlerContext): void {
   safeOn(ctx, 'start-timer-chp', () => {
     if (!isStaff(ctx)) return;
     session.chpBuzzerOpen = true;
-    timer.startMainClock(rules.chpTurnSeconds);
+    timers.startMain(rules.chpTurnSeconds, rules.clockStartDelayMs.CHP);
     io.emit('unlock-button-chp');
   });
 
   safeOn(ctx, 'get-turn-chp', () => {
-    if (!session.chpBuzzerOpen || !timer.isRunning()) return;
+    if (!session.chpBuzzerOpen || !timers.main.isRunning()) return;
     if (session.chpTurnPlayerIndex !== NO_PLAYER) return;
     const playerIndex = resolvePlayerIndex(ctx);
     if (playerIndex === NO_PLAYER) return;
@@ -58,7 +58,7 @@ export function registerChpHandlers(ctx: HandlerContext): void {
     io.emit('lock-button-chp');
     io.emit('play-sfx', SFX_GET_TURN);
     io.emit('got-turn-chp', playerIndex);
-    timer.togglePause();
+    timers.togglePause();
   });
 
   safeOn(ctx, 'mark-correct-chp', () => {
@@ -80,7 +80,7 @@ export function registerChpHandlers(ctx: HandlerContext): void {
     const holder = session.chpTurnPlayerIndex;
     if (holder === NO_PLAYER) return;
 
-    timer.togglePause();
+    timers.togglePause();
     io.emit('play-sfx', SFX_WRONG);
     session.chpBuzzerOpen = true;
     io.emit('unlock-button-chp');

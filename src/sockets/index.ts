@@ -178,7 +178,7 @@ export function registerSockets(deps: SocketDeps): void {
       identity,
       store: room.store,
       session: room.session,
-      timer: room.timer,
+      timers: room.timers,
       rules: room.rules,
       log,
       isSessionAlive: () =>
