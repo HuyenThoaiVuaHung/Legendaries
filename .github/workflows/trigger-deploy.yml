@@ -1,0 +1,17 @@
+name: Trigger deploy
+
+# Pushing to main here redeploys production via the Legions deploy workflow.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch Legions deploy
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: gh workflow run deploy.yml --ref main -R ${{ github.repository_owner }}/Legions
