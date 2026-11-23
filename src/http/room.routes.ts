@@ -32,24 +32,32 @@ import {
   JoinRoomResponse,
   Role,
   RoomInfo,
-  RoomSecrets,
   RotateSecretRequest,
+  RotateSecretRole,
   TokenPayload,
   TransferRoomRequest,
 } from '../contracts/api';
+import { applyRuleOverrides, PLAYER_COUNT, rulesForMatchVersion } from '../game.rules';
 import { Room } from '../rooms/room';
 import { DEFAULT_ROOM_ID } from '../rooms/room.registry';
-import { BankStore } from '../services/bank.store';
+import { BankError, QuestionBankStore } from '../services/question-bank.store';
 import { QuotaError } from '../services/legion-file.service';
 import { bankError } from './bank.routes';
 import { AccountStore } from '../services/account.store';
-import { AuthedRequest, accountOf, bearerToken, identityOf, param, requireAccount, requireAuth, roomOf } from './middleware';
+import { AuthedRequest, accountOf, identityOf, param, requireAccount, requireAuth, roomOf } from './middleware';
 import type { ApiDeps } from './index';
 
 const MS_PER_SECOND = 1000;
-const USERNAME_MAX_LENGTH = 32;
-const ROTATABLE_ROLES: readonly (keyof RoomSecrets)[] = ['admin', 'mc', 'player', 'spectator'];
-const ROLE_OF_SECRET: Readonly<Record<keyof RoomSecrets, Role>> = {
+const ROOM_NAME_MAX_LENGTH = 80;
+const MATCH_UPDATE_EVENT = 'update-match-data';
+
+function parseRoomName(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed.length >= 1 && trimmed.length <= ROOM_NAME_MAX_LENGTH ? trimmed : null;
+}
+const ROTATABLE_ROLES: readonly RotateSecretRole[] = ['admin', 'mc', 'player', 'spectator'];
+const ROLE_OF_SECRET: Readonly<Record<RotateSecretRole, Role>> = {
   admin: Role.Admin,
   mc: Role.Mc,
   player: Role.Player,
@@ -66,7 +74,7 @@ function secretMatches(given: string, expected: string): boolean {
   return timingSafeEqual(digest(given), digest(expected));
 }
 
-function newSecret(role: keyof RoomSecrets): string {
+function newSecret(role: RotateSecretRole): string {
   if (role === 'admin') return randomBytes(ADMIN_SECRET_BYTES).toString('base64url');
   let out = '';
   for (let i = 0; i < SECRET_LENGTH[role]; i++) {
@@ -90,7 +98,7 @@ function createdRoomOf(req: Request, res: Response): (Room & { meta: NonNullable
   return room as Room & { meta: NonNullable<Room['meta']> };
 }
 
-export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: BankStore): Router {
+export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: QuestionBankStore): Router {
   const { rooms, auth, config, log } = deps;
   const router = Router();
   const adminOnly = requireAuth(auth, Role.Admin);
@@ -115,40 +123,6 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
     'Too many join attempts, try again later',
   );
 
-  function claimSeat(room: Room, rawUsername: unknown, req: Request, res: Response): number | null {
-    const username = typeof rawUsername === 'string' ? rawUsername.trim() : '';
-    if (username === '' || username.length > USERNAME_MAX_LENGTH) {
-      fail(res, 400, `A username of 1?${USERNAME_MAX_LENGTH} characters is required`);
-      return null;
-    }
-    const held = room.seatOf(username);
-    if (held !== -1) {
-      const current = auth.verifyToken(bearerToken(req));
-      if (!current || current.roomId !== room.id || current.roleId !== Role.Player || current.index !== held) {
-        fail(res, 409, 'That username already holds a seat; ask the room admin to release it');
-        return null;
-      }
-      auth.sessions.revoke(current.sessionId);
-      return held;
-    }
-    if (!room.meta?.seats.includes(null)) {
-      fail(res, 409, 'All player seats are taken');
-      return null;
-    }
-    if (room.store.getMatch().position !== 'H') {
-      fail(res, 423, 'Match in progress; seats are locked');
-      return null;
-    }
-    const seat = room.claimFreeSeat(username);
-    if (seat === null) {
-      fail(res, 409, 'All player seats are taken');
-      return null;
-    }
-    rooms.saveMeta(room);
-    log(`Room ${room.id}: ${username} holds seat ${seat}`);
-    return seat;
-  }
-
   router.post(API_PATHS.rooms, hostOnly, createLimiter, async (req, res) => {
     const { accountId } = accountOf(req);
     if (rooms.ownedBy(accountId).length >= config.maxRoomsPerAccount) {
@@ -162,20 +136,27 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
     }
     const bankItemId = req.body?.bankItemId;
     if (bankItemId !== undefined) {
-      const archive = typeof bankItemId === 'string' ? bank.read(accountId, bankItemId) : undefined;
-      if (!archive) {
-        rooms.remove(room.id);
-        fail(res, 404, 'No such bank item');
-        return;
-      }
       try {
-        await room.legionFiles.importArchive(archive, {
-          maxMediaBytes: room.quotaRemaining(config.roomMediaQuotaBytes),
+        if (typeof bankItemId !== 'string') throw new BankError(400, 'Invalid question set');
+        bank.access(bankItemId, accountId, true);
+        bank.assertIdle(bankItemId);
+        const maxMediaBytes = room.quotaRemaining(config.roomMediaQuotaBytes);
+        const files = bank.files(bankItemId, accountId, maxMediaBytes);
+        const editorData = bank.editorData(bankItemId, accountId);
+        applyRuleOverrides(room.rules, rulesForMatchVersion(editorData.matchData.matchVersion));
+        rooms.saveMeta(room);
+        room.legionFiles.importData(editorData, files, { maxMediaBytes });
+        room.store.round('vcnv').update((vcnv) => {
+          vcnv.obstacle.value = room.rules.obstacleValueByRevealedCount[0] ?? vcnv.obstacle.value;
         });
       } catch (err) {
         rooms.remove(room.id);
         if (err instanceof QuotaError) {
           fail(res, 413, 'Room storage is full');
+          return;
+        }
+        if (err instanceof BankError) {
+          fail(res, err.status, err.message);
           return;
         }
         fail(res, 400, err instanceof Error ? err.message : String(err));
@@ -191,6 +172,30 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
       roleId: Role.Admin,
     };
     res.status(201).json(response);
+  });
+
+  router.patch('/api/rooms/:roomId', hostOnly, (req, res) => {
+    const { accountId } = accountOf(req);
+    const room = rooms.get(param(req, 'roomId'));
+    if (!room?.meta || room.meta.ownerAccountId !== accountId) {
+      fail(res, 404, 'No such room');
+      return;
+    }
+    const name = parseRoomName(req.body?.name);
+    if (!name) {
+      fail(res, 400, `Room name must be 1-${ROOM_NAME_MAX_LENGTH} characters`);
+      return;
+    }
+    const match = room.store.updateMatch((m) => {
+      m.matchName = name;
+    });
+    room.channel.emit(MATCH_UPDATE_EVENT, match);
+    res.json({
+      roomId: room.id,
+      code: room.meta.code,
+      name: match.matchName,
+      createdAt: room.meta.createdAt,
+    });
   });
 
   router.post('/api/rooms/:roomId/enter', hostOnly, (req, res) => {
@@ -234,21 +239,23 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
       }
       payload = { roleId: Role.Viewer, roomId: room.id };
     } else if (secretMatches(secret, secrets.spectator)) {
+      if (room.meta.spectatorMode === 'off') {
+        fail(res, 403, 'Spectators are disabled');
+        return;
+      }
       payload = { roleId: Role.Viewer, roomId: room.id };
     } else if (secretMatches(secret, secrets.admin)) {
       payload = { roleId: Role.Admin, roomId: room.id };
     } else if (secretMatches(secret, secrets.mc)) {
       payload = { roleId: Role.Mc, roomId: room.id };
-    } else if (secretMatches(secret, secrets.player)) {
-      const name = typeof body.username === 'string' && body.username.trim() !== ''
-        ? body.username
-        : `Thí sinh ${room.meta.seats.indexOf(null) + 1}`;
-      const seat = claimSeat(room, name, req, res);
-      if (seat === null) return;
-      payload = { roleId: Role.Player, index: seat, roomId: room.id };
     } else {
-      fail(res, 401, 'Wrong secret');
-      return;
+      const seat = secrets.players.findIndex((code) => secretMatches(secret, code));
+      if (seat === -1) {
+        fail(res, 401, 'Wrong secret');
+        return;
+      }
+      rooms.revokeSessions(room.id, (record) => record.roleId === Role.Player && record.index === seat);
+      payload = { roleId: Role.Player, index: seat, roomId: room.id };
     }
 
     const response: JoinRoomResponse = {
@@ -279,9 +286,12 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
     const roleId = link.role === 'player' ? Role.Player : link.role === 'mc' ? Role.Mc : Role.Viewer;
     const payload: TokenPayload = { roleId, roomId: room.id };
     if (roleId === Role.Player) {
-      const seat = claimSeat(room, req.body?.username, req, res);
-      if (seat === null) return;
-      payload.index = seat;
+      if (typeof link.playerIndex !== 'number' || !Number.isInteger(link.playerIndex) || link.playerIndex < 0 || link.playerIndex >= PLAYER_COUNT) {
+        fail(res, 401, 'Invalid or expired link');
+        return;
+      }
+      rooms.revokeSessions(room.id, (record) => record.roleId === Role.Player && record.index === link.playerIndex);
+      payload.index = link.playerIndex;
     }
     const tokenOut = auth.issueToken({ ...payload, linkId: link.id });
     if (link.singleUse) {
@@ -296,17 +306,29 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
   router.patch(API_PATHS.roomSettings, adminOnly, (req, res) => {
     const room = createdRoomOf(req, res);
     if (!room) return;
-    const { spectatorMode: mode, listed } = (req.body ?? {}) as RoomSettingsRequest;
+    const { spectatorMode: mode, listed, name } = (req.body ?? {}) as RoomSettingsRequest;
+    const parsedName = name === undefined ? undefined : parseRoomName(name);
     if ((mode !== undefined && !['open', 'secret', 'off'].includes(mode)) ||
       (listed !== undefined && typeof listed !== 'boolean') ||
-      (mode === undefined && listed === undefined)) {
+      (name !== undefined && parsedName === null) ||
+      (mode === undefined && listed === undefined && name === undefined)) {
       fail(res, 400, 'Invalid room settings');
       return;
     }
+    const previousMode = room.meta.spectatorMode;
     if (mode !== undefined) room.meta.spectatorMode = mode;
     if (listed !== undefined) room.meta.listed = listed;
-    rooms.saveMeta(room);
-    res.json({ spectatorMode: room.meta.spectatorMode, listed: room.meta.listed });
+    if (mode !== undefined || listed !== undefined) rooms.saveMeta(room);
+    if (mode !== undefined && mode !== previousMode && (mode === 'off' || (mode === 'secret' && previousMode === 'open'))) {
+      rooms.revokeSessions(room.id, (record) => record.roleId === Role.Viewer && record.linkId === undefined);
+    }
+    if (parsedName) {
+      const match = room.store.updateMatch((m) => {
+        m.matchName = parsedName;
+      });
+      room.channel.emit(MATCH_UPDATE_EVENT, match);
+    }
+    res.json({ spectatorMode: room.meta.spectatorMode, listed: room.meta.listed, name: room.store.getMatch().matchName });
   });
 
   router.post(API_PATHS.roomLinks, adminOnly, (req, res) => {
@@ -315,6 +337,7 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
     const body = (req.body ?? {}) as CreateRoomLinkRequest;
     if (!['viewer', 'mc', 'player'].includes(body.role) || typeof body.label !== 'string' ||
       body.label.trim().length < 1 || body.label.length > 60 ||
+      (body.role === 'player' && (!Number.isInteger(body.playerIndex) || body.playerIndex! < 0 || body.playerIndex! >= PLAYER_COUNT)) ||
       (body.view !== undefined && (typeof body.view !== 'string' || body.view.length > 32)) ||
       (body.singleUse !== undefined && typeof body.singleUse !== 'boolean') ||
       (body.expiresInSeconds !== undefined && (typeof body.expiresInSeconds !== 'number' || !Number.isFinite(body.expiresInSeconds) || body.expiresInSeconds <= 0))) {
@@ -326,6 +349,7 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
       id: randomUUID(), tokenHash: createHash('sha256').update(token).digest('hex'),
       role: body.role, label: body.label, createdAt: Date.now(), singleUse: body.singleUse ?? false,
     };
+    if (body.role === 'player') link.playerIndex = body.playerIndex;
     if (body.view !== undefined) link.view = body.view;
     if (body.expiresInSeconds !== undefined) link.expiresAt = link.createdAt + body.expiresInSeconds * MS_PER_SECOND;
     room.meta.links.push(link);
@@ -369,24 +393,9 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
       return;
     }
     try {
-      const archive = await room.legionFiles.exportArchive();
-      const matchName = room.store.getMatch().matchName;
-      if (bankItemId !== undefined) {
-        const item = bank.replace(accountId, bankItemId, matchName, archive.buffer);
-        if (!item) {
-          fail(res, 404, 'No such bank item');
-          return;
-        }
-        res.json(item);
-      } else {
-        const item = bank.add(
-          accountId,
-          name === undefined ? matchName : name,
-          matchName,
-          archive.buffer,
-        );
-        res.status(201).json(item);
-      }
+      const item = bank.importData(accountId, room.legionFiles.exportData(), room.legionFiles.exportFiles(), bankItemId);
+      if (name !== undefined) bank.rename(item.id, accountId, name);
+      res.status(bankItemId ? 200 : 201).json(bank.item(item.id, accountId));
     } catch (err) {
       bankError(res, err);
     }
@@ -398,8 +407,8 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
     const info: RoomInfo = {
       roomId: room.id,
       code: room.meta.code,
+      name: room.store.getMatch().matchName,
       expiresAt: room.expiresAt(config.roomIdleTtlSeconds * MS_PER_SECOND, config.roomMaxTtlSeconds * MS_PER_SECOND),
-      seats: room.meta.seats,
       spectatorMode: room.meta.spectatorMode,
       listed: room.meta.listed,
       ownerAccountId: room.meta.ownerAccountId,
@@ -413,6 +422,11 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
   router.delete(API_PATHS.currentRoom, adminOnly, (req, res) => {
     const room = createdRoomOf(req, res);
     if (!room) return;
+    const callerAccount = (req as AuthedRequest).identity?.accountId;
+    if (!callerAccount || callerAccount !== room.meta.ownerAccountId) {
+      fail(res, 403, 'Only the room owner can close it');
+      return;
+    }
     rooms.remove(room.id);
     res.status(204).end();
   });
@@ -420,14 +434,30 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
   router.post(API_PATHS.rotateSecret, adminOnly, (req, res) => {
     const room = createdRoomOf(req, res);
     if (!room) return;
-    const { role } = (req.body ?? {}) as RotateSecretRequest;
+    const { role, playerIndex } = (req.body ?? {}) as RotateSecretRequest;
     if (!ROTATABLE_ROLES.includes(role)) {
       fail(res, 400, `role must be one of: ${ROTATABLE_ROLES.join(', ')}`);
       return;
     }
+    const callerSession = (req as AuthedRequest).identity?.sessionId;
+    if (role === 'player') {
+      if (typeof playerIndex !== 'number' || !Number.isInteger(playerIndex) || playerIndex < 0 || playerIndex >= PLAYER_COUNT) {
+        fail(res, 400, `playerIndex must be 0-${PLAYER_COUNT - 1}`);
+        return;
+      }
+      room.meta.secrets.players[playerIndex] = newSecret('player');
+      rooms.saveMeta(room);
+      const revoked = rooms.revokeSessions(
+        room.id,
+        (record) => record.roleId === Role.Player && record.index === playerIndex,
+        callerSession,
+      );
+      log(`Room ${room.id}: rotated player ${playerIndex} secret, revoked ${revoked} session(s)`);
+      res.json(room.meta.secrets);
+      return;
+    }
     room.meta.secrets[role] = newSecret(role);
     rooms.saveMeta(room);
-    const callerSession = (req as AuthedRequest).identity?.sessionId;
     const roleId = ROLE_OF_SECRET[role];
     const revoked = rooms.revokeSessions(
       room.id,
@@ -436,21 +466,6 @@ export function createRoomRoutes(deps: ApiDeps, accounts: AccountStore, bank: Ba
     );
     log(`Room ${room.id}: rotated ${role} secret, revoked ${revoked} session(s)`);
     res.json(room.meta.secrets);
-  });
-
-  router.delete('/api/rooms/current/seats/:index', adminOnly, (req, res) => {
-    const room = createdRoomOf(req, res);
-    if (!room) return;
-    const index = Number(req.params.index);
-    if (!Number.isInteger(index) || index < 0 || index >= room.meta.seats.length) {
-      fail(res, 400, `Seat index out of range: ${req.params.index}`);
-      return;
-    }
-    const holder = room.releaseSeat(index);
-    rooms.saveMeta(room);
-    rooms.revokeSessions(room.id, (record) => record.roleId === Role.Player && record.index === index);
-    log(`Room ${room.id}: released seat ${index}${holder ? ` (${holder})` : ''}`);
-    res.status(204).end();
   });
 
   router.post(API_PATHS.transferRoom, adminOnly, (req, res) => {

@@ -1,5 +1,8 @@
 import AdmZip from 'adm-zip';
+import { existsSync, readFileSync } from 'fs';
 import { randomUUID } from 'crypto';
+import { join } from 'path';
+import { Worker } from 'worker_threads';
 import { BRAND_SLOTS, LegionImportResponse, UiConfig } from '../contracts/api';
 import {
   ChpRound,
@@ -21,9 +24,12 @@ import {
 import {
   DEFAULT_GAME_RULES,
   PLAYER_COUNT,
+  VCNV_PIECE_COUNT,
   VCNV_ROW_COUNT,
 } from '../game.rules';
 import { MatchStore } from '../state/match.store';
+import { ArchiveErrorCode, ArchiveParseError, parseArchiveBuffer, ParsedArchive } from './archive-worker';
+import { validateMediaFile } from './media-validation';
 import { UiConfigStore } from './ui-config.store';
 import { MediaStore, sanitizeFileName } from './media.store';
 
@@ -83,7 +89,7 @@ interface EditorQuestionBank {
   chp?: { questions: EditorQuestion[] };
 }
 
-interface EditorData {
+export interface EditorData {
   uiConfig?: unknown;
   matchData: EditorMatchData;
   questionBank: EditorQuestionBank;
@@ -96,8 +102,8 @@ interface EditorData {
 // ---------------------------------------------------------------------------
 
 const EDITOR_DATA_ENTRY = 'editorData.json';
-const MAX_ARCHIVE_ENTRIES = 1000;
-const MAX_ARCHIVE_TOTAL_BYTES = 1024 * 1024 * 1024; // 1 GiB decompressed
+const MAX_CONCURRENT_ARCHIVE_IMPORTS = 2;
+let activeArchiveImports = 0;
 /** Media folders a .legion archive may contain, mirrored as media kinds. */
 const MEDIA_FOLDERS = [...ROUND_KINDS, 'misc'] as const;
 type MediaFolder = (typeof MEDIA_FOLDERS)[number];
@@ -110,7 +116,7 @@ const importedRoundFile = (kind: RoundKind): string =>
 /** A freshly imported match starts at the home screen. */
 const IMPORT_START_POSITION: MatchPosition = 'H';
 /** matchVersion the export declares (the current editor format). */
-const EXPORT_MATCH_VERSION = 24;
+const EXPORT_MATCH_VERSION = 26;
 /** Editor MatchPosition.IDLE — exports always start idle. */
 const EDITOR_MATCH_POS_IDLE = 0;
 /** Sentinel: no TT question is active yet. */
@@ -158,6 +164,27 @@ export class QuotaError extends Error {
   }
 }
 
+export class ArchiveBusyError extends Error {
+  constructor() {
+    super('Too many archive imports in progress, try again shortly');
+    this.name = 'ArchiveBusyError';
+  }
+}
+
+export class ArchiveLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ArchiveLimitError';
+  }
+}
+
+export class UnsupportedMediaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnsupportedMediaError';
+  }
+}
+
 export class LegionFileService {
   constructor(
     private readonly store: MatchStore,
@@ -166,27 +193,104 @@ export class LegionFileService {
   ) {}
 
   /**
-   * Unpack an archive: extract media into the media store, convert the
-   * question bank into fresh round files, and reset the match state.
+   * Unpack an archive off the main thread: extract media into the media store,
+   * convert the question bank into fresh round files, and reset the match state.
    * The caller (HTTP route) is responsible for emitting the update-* pushes.
    */
-  importArchive(buffer: Buffer, options: { maxMediaBytes?: number } = {}): LegionImportResponse {
-    const { editorData, files, totalMediaBytes } = parseArchive(buffer);
+  async importArchive(
+    buffer: Buffer,
+    options: { maxMediaBytes?: number } = {},
+  ): Promise<LegionImportResponse> {
+    const { editorData, files } = await parseArchiveAsync(buffer, options);
+    return this.importData(editorData, files, options);
+  }
+
+  /** Load structured content and media directly, without an archive. */
+  importData(editorData: EditorData, files: { folder: MediaFolder; name: string; data: Buffer }[], options: { maxMediaBytes?: number } = {}): LegionImportResponse {
+    const totalMediaBytes = files.reduce((sum, file) => sum + file.data.length, 0);
     if (options.maxMediaBytes !== undefined && totalMediaBytes > options.maxMediaBytes) {
       throw new QuotaError();
     }
-    const mediaCounts: Partial<Record<MediaFolder, number>> = {};
-    const miscNames = new Map<string, string>();
     for (const file of files) {
-      const stored = this.media.saveWithName(file.folder, file.name, file.data);
-      if (file.folder === 'misc') miscNames.set(file.name, stored);
+      if (!validateMediaFile(file.name, file.data)) {
+        throw new UnsupportedMediaError(`Unsupported or invalid media file: ${file.name}`);
+      }
+    }
+    const bank = editorData.questionBank;
+    const rawObstaclePieces = (bank.vcnv?.cnvMediaSrcNames ?? []).filter(
+      (name): name is string => typeof name === 'string' && name.trim() !== '',
+    );
+    const vcnvFilesByName = new Map<string, { folder: MediaFolder; name: string; data: Buffer }>();
+    for (const file of files) {
+      if (file.folder !== 'vcnv') continue;
+      vcnvFilesByName.set(file.name, file);
+      vcnvFilesByName.set(sanitizeFileName(file.name), file);
+    }
+    const matchedPieceFiles =
+      rawObstaclePieces.length === VCNV_PIECE_COUNT
+        ? rawObstaclePieces.map((name) => vcnvFilesByName.get(name) ?? vcnvFilesByName.get(sanitizeFileName(name)))
+        : [];
+    const hasAllProtectedPieces =
+      matchedPieceFiles.length === VCNV_PIECE_COUNT && matchedPieceFiles.every((f) => f !== undefined);
+    const rowReferencedVcnv = new Set(
+      (bank.vcnv?.questions ?? [])
+        .map((q) => q.mediaSrcName)
+        .filter((name): name is string => typeof name === 'string' && name !== '')
+        .flatMap((name) => [name, sanitizeFileName(name)]),
+    );
+    const protectedPieceSet = new Set(
+      hasAllProtectedPieces
+        ? matchedPieceFiles.flatMap((f) => [f!.name, sanitizeFileName(f!.name)])
+        : [],
+    );
+
+    const mediaCounts: Partial<Record<MediaFolder, number>> = {};
+    const storedByFolder = new Map<MediaFolder, Map<string, string>>();
+    const recordStored = (folder: MediaFolder, originalName: string, storedName: string): void => {
+      let map = storedByFolder.get(folder);
+      if (!map) {
+        map = new Map<string, string>();
+        storedByFolder.set(folder, map);
+      }
+      map.set(originalName, storedName);
+      map.set(sanitizeFileName(originalName), storedName);
+    };
+    const resolveMedia: MediaNameResolver = (folder, name) => {
+      if (!name) return undefined;
+      const map = storedByFolder.get(folder);
+      return map?.get(name) ?? map?.get(sanitizeFileName(name)) ?? name;
+    };
+    const obstaclePieceFiles = hasAllProtectedPieces
+      ? matchedPieceFiles.map((file) => {
+          mediaCounts.vcnv = (mediaCounts.vcnv ?? 0) + 1;
+          return this.media.saveObstaclePiece(file!.name, file!.data);
+        })
+      : undefined;
+
+    const UNGUESSABLE_NAME = /^(?:[0-9a-f]{32}-|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.)/i;
+    for (const file of files) {
+      if (
+        file.folder === 'vcnv' &&
+        protectedPieceSet.has(file.name) &&
+        !rowReferencedVcnv.has(file.name) &&
+        !rowReferencedVcnv.has(sanitizeFileName(file.name))
+      ) {
+        continue;
+      }
+      const cleanName = sanitizeFileName(file.name);
+      const stored = UNGUESSABLE_NAME.test(cleanName)
+        ? this.media.saveWithName(file.folder, cleanName, file.data)
+        : this.media.save(file.folder, file.name, file.data).fileName;
+      recordStored(file.folder, file.name, stored);
       mediaCounts[file.folder] = (mediaCounts[file.folder] ?? 0) + 1;
     }
     const raw = editorData.uiConfig as Partial<UiConfig> | null;
     const names: UiConfig['miscImageSrcNames'] = {};
+    const miscMap = storedByFolder.get('misc');
     for (const slot of BRAND_SLOTS) {
       const name = raw?.miscImageSrcNames?.[slot];
-      if (typeof name === 'string' && miscNames.has(name)) names[slot] = miscNames.get(name)!;
+      const stored = typeof name === 'string' ? (miscMap?.get(name) ?? miscMap?.get(sanitizeFileName(name))) : undefined;
+      if (stored) names[slot] = stored;
     }
     this.ui.set({
       darkMode: raw?.darkMode === true,
@@ -212,11 +316,10 @@ export class LegionFileService {
       }
     });
 
-    const bank = editorData.questionBank;
-    this.store.round('kd').set(mapKdRound(bank.kd));
-    this.store.round('vcnv').set(mapVcnvRound(bank.vcnv));
-    this.store.round('tt').set(mapTtRound(bank.tt?.questions ?? []));
-    this.store.round('vd').set(mapVdRound(bank.vd?.questions ?? []));
+    this.store.round('kd').set(mapKdRound(bank.kd, resolveMedia));
+    this.store.round('vcnv').set(mapVcnvRound(bank.vcnv, obstaclePieceFiles, resolveMedia));
+    this.store.round('tt').set(mapTtRound(bank.tt?.questions ?? [], resolveMedia));
+    this.store.round('vd').set(mapVdRound(bank.vd?.questions ?? [], resolveMedia));
     this.store.round('chp').set(mapChpRound(bank.chp?.questions ?? []));
 
     return { matchName, mediaCounts };
@@ -232,7 +335,7 @@ export class LegionFileService {
    * current canonical data and bundle every referenced media file that still
    * exists on disk.
    */
-  exportArchive(): { fileName: string; buffer: Buffer } {
+  exportData(): EditorData {
     const match = this.store.getMatch();
     const kd = this.store.round('kd').get();
     const vcnv = this.store.round('vcnv').get();
@@ -267,7 +370,12 @@ export class LegionFileService {
         vcnv: {
           questions: vcnvRows.map(vcnvToEditor),
           cnv: obstacle.answer,
-          cnvMediaSrcNames: obstacle.imageFile ? [obstacle.imageFile] : [],
+          cnvMediaSrcNames:
+            obstacle.imagePieceFiles?.length === VCNV_PIECE_COUNT
+              ? [...obstacle.imagePieceFiles]
+              : obstacle.imageFile
+                ? [obstacle.imageFile]
+                : [],
         },
         tt: { questions: tt.questions.map(ttToEditor) },
         vd: { questions: vd.questionPools.map((pool) => pool.map(vdToEditor)) },
@@ -282,6 +390,46 @@ export class LegionFileService {
       },
     };
 
+    return editorData;
+  }
+
+  /** Referenced media as ordinary files for database-backed banks. */
+  exportFiles(): { folder: MediaFolder; name: string; data: Buffer }[] {
+    const vcnv = this.store.round('vcnv').get();
+    const referenced = collectReferencedMedia({ kd: this.store.round('kd').get(), vcnv, tt: this.store.round('tt').get(), vd: this.store.round('vd').get() });
+    const files: { folder: MediaFolder; name: string; data: Buffer }[] = [];
+    const exportedVcnv = new Set<string>();
+    for (const [folder, names] of referenced) for (const name of names) {
+      const path = this.media.resolve(folder, name);
+      if (path) {
+        files.push({ folder, name, data: readFileSync(path) });
+        if (folder === 'vcnv') exportedVcnv.add(name);
+      }
+    }
+    if (vcnv.obstacle.imagePieceFiles?.length === VCNV_PIECE_COUNT) {
+      for (const name of vcnv.obstacle.imagePieceFiles) {
+        if (exportedVcnv.has(name)) continue;
+        const path = this.media.resolveObstaclePiece(name);
+        if (path) {
+          files.push({ folder: 'vcnv', name, data: readFileSync(path) });
+          exportedVcnv.add(name);
+        }
+      }
+    }
+    for (const name of new Set(Object.values(this.ui.get().miscImageSrcNames))) {
+      const path = name ? this.media.resolve('misc', name) : undefined;
+      if (path && name) files.push({ folder: 'misc', name, data: readFileSync(path) });
+    }
+    return files;
+  }
+
+  exportArchive(): { fileName: string; buffer: Buffer } {
+    const editorData = this.exportData();
+    const match = this.store.getMatch();
+    const kd = this.store.round('kd').get();
+    const vcnv = this.store.round('vcnv').get();
+    const tt = this.store.round('tt').get();
+    const vd = this.store.round('vd').get();
     const zip = new AdmZip();
     const ui = editorData.uiConfig as UiConfig;
     const addedMisc = new Set<string>();
@@ -298,7 +446,7 @@ export class LegionFileService {
       }
     }
     zip.addFile(EDITOR_DATA_ENTRY, Buffer.from(JSON.stringify(editorData)));
-    this.addMediaFiles(zip, collectReferencedMedia({ kd, vcnv, tt, vd }));
+    this.addMediaFiles(zip, collectReferencedMedia({ kd, vcnv, tt, vd }), vcnv.obstacle.imagePieceFiles);
 
     const baseName = sanitizeFileName(match.matchName);
     const fileName = `${baseName === 'file' ? EXPORT_FALLBACK_NAME : baseName}.legion`;
@@ -307,11 +455,29 @@ export class LegionFileService {
 
   // ------------------------------------------------------------------ media
 
-  private addMediaFiles(zip: AdmZip, referenced: Map<RoundKind, Set<string>>): void {
+  private addMediaFiles(
+    zip: AdmZip,
+    referenced: Map<RoundKind, Set<string>>,
+    obstaclePieceFiles?: string[],
+  ): void {
+    const addedVcnv = new Set<string>();
     for (const [kind, names] of referenced) {
       for (const name of names) {
         const path = this.media.resolve(kind, name);
-        if (path) zip.addLocalFile(path, kind, name);
+        if (path) {
+          zip.addLocalFile(path, kind, name);
+          if (kind === 'vcnv') addedVcnv.add(name);
+        }
+      }
+    }
+    if (obstaclePieceFiles?.length === VCNV_PIECE_COUNT) {
+      for (const name of obstaclePieceFiles) {
+        if (addedVcnv.has(name)) continue;
+        const path = this.media.resolveObstaclePiece(name);
+        if (path) {
+          zip.addLocalFile(path, 'vcnv', name);
+          addedVcnv.add(name);
+        }
       }
     }
   }
@@ -323,70 +489,109 @@ export class LegionFileService {
 
 /** Validate an archive and return its match name without writing any files. */
 export async function inspectLegionArchive(buffer: Buffer): Promise<{ matchName: string }> {
-  const { editorData } = parseArchive(buffer);
+  const { editorData } = await parseArchiveAsync(buffer);
   return { matchName: editorData.matchData.matchName ?? '' };
 }
 
-function parseArchive(buffer: Buffer): { editorData: EditorData; files: { folder: MediaFolder; name: string; data: Buffer }[]; totalMediaBytes: number } {
-  const zip = new AdmZip(buffer);
-  const editorData = readEditorData(zip);
-  const files: { folder: MediaFolder; name: string; data: Buffer }[] = [];
-  let total = 0;
-  for (const entry of zip.getEntries()) {
-    if (entry.isDirectory || entry.entryName === EDITOR_DATA_ENTRY) continue;
-    const segments = entry.entryName.replace(/\\/g, '/').split('/').filter(Boolean);
-    if (segments.length < 2) continue;
-    const folder = segments[0] as MediaFolder;
-    if (!MEDIA_FOLDERS.includes(folder)) continue;
-    if (files.length + 1 > MAX_ARCHIVE_ENTRIES) throw new Error('Archive has too many media entries');
-    const data = entry.getData();
-    total += data.length;
-    if (total > MAX_ARCHIVE_TOTAL_BYTES) throw new Error('Archive decompresses past the allowed total media size');
-    files.push({ folder, name: segments[segments.length - 1], data });
+function mapArchiveError(code: ArchiveErrorCode, message: string): Error {
+  switch (code) {
+    case 'QUOTA':
+      return new QuotaError();
+    case 'LIMIT':
+      return new ArchiveLimitError(message);
+    case 'MEDIA':
+      return new UnsupportedMediaError(message);
+    default:
+      return new Error(message);
   }
-  // Exercise the same conversion during inspection, before any import writes.
-  const bank = editorData.questionBank;
-  mapKdRound(bank.kd);
-  mapVcnvRound(bank.vcnv);
-  mapTtRound(bank.tt?.questions ?? []);
-  mapVdRound(bank.vd?.questions ?? []);
-  mapChpRound(bank.chp?.questions ?? []);
-  if (typeof editorData.matchData.matchName !== 'string' || !Array.isArray(editorData.matchData.players)) {
-    throw new Error('Invalid .legion file: invalid match data');
-  }
-  return { editorData, files, totalMediaBytes: total };
 }
 
-function readEditorData(zip: AdmZip): EditorData {
-  const entry = zip.getEntry(EDITOR_DATA_ENTRY);
-  if (!entry) {
-    throw new Error(`Invalid .legion file: missing ${EDITOR_DATA_ENTRY}`);
+async function runArchiveWorker(
+  buffer: Buffer,
+  options: { maxMediaBytes?: number },
+): Promise<ParsedArchive> {
+  const workerPath = join(__dirname, 'archive-worker.js');
+  if (!existsSync(workerPath)) {
+    try {
+      return parseArchiveBuffer(buffer, options);
+    } catch (err) {
+      if (err instanceof ArchiveParseError) throw mapArchiveError(err.code, err.message);
+      throw err;
+    }
   }
-  let parsed: unknown;
+  return new Promise<ParsedArchive>((resolve, reject) => {
+    const worker = new Worker(workerPath, {
+      workerData: {
+        buffer,
+        maxMediaBytes: options.maxMediaBytes,
+      },
+    });
+    let settled = false;
+    const done = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    worker.once('message', (msg: { ok: true; result: ParsedArchive } | { ok: false; code: ArchiveErrorCode; message: string }) => {
+      done(() => {
+        if (msg.ok) resolve(msg.result);
+        else reject(mapArchiveError(msg.code, msg.message));
+      });
+    });
+    worker.once('error', (err) => done(() => reject(err)));
+    worker.once('exit', (code) => {
+      if (code !== 0) done(() => reject(new Error(`Archive worker exited with code ${code}`)));
+    });
+  });
+}
+
+export async function parseArchiveAsync(
+  buffer: Buffer,
+  options: { maxMediaBytes?: number } = {},
+): Promise<{ editorData: EditorData; files: { folder: MediaFolder; name: string; data: Buffer }[]; totalMediaBytes: number }> {
+  if (activeArchiveImports >= MAX_CONCURRENT_ARCHIVE_IMPORTS) {
+    throw new ArchiveBusyError();
+  }
+  activeArchiveImports += 1;
   try {
-    parsed = JSON.parse(entry.getData().toString('utf8'));
-  } catch {
-    throw new Error(`Invalid .legion file: ${EDITOR_DATA_ENTRY} is not valid JSON`);
+    const parsed = await runArchiveWorker(buffer, options);
+    const editorData = parsed.editorData as EditorData;
+    const bank = editorData.questionBank;
+    mapKdRound(bank.kd);
+    mapVcnvRound(bank.vcnv);
+    mapTtRound(bank.tt?.questions ?? []);
+    mapVdRound(bank.vd?.questions ?? []);
+    mapChpRound(bank.chp?.questions ?? []);
+    if (typeof editorData.matchData?.matchName !== 'string' || !Array.isArray(editorData.matchData?.players)) {
+      throw new Error('Invalid .legion file: invalid match data');
+    }
+    const files = parsed.files.map((f) => ({
+      folder: f.folder as MediaFolder,
+      name: f.name,
+      data: Buffer.from(f.data.buffer, f.data.byteOffset, f.data.byteLength),
+    }));
+    return { editorData, files, totalMediaBytes: parsed.totalMediaBytes };
+  } finally {
+    activeArchiveImports -= 1;
   }
-  const data = parsed as Partial<EditorData> | null;
-  if (!data || typeof data !== 'object' || !data.matchData || !data.questionBank) {
-    throw new Error(
-      `Invalid .legion file: ${EDITOR_DATA_ENTRY} must contain matchData and questionBank`,
-    );
-  }
-  return data as EditorData;
 }
 
 // ---------------------------------------------------------------------------
 // Editor question bank → canonical rounds
 // ---------------------------------------------------------------------------
 
-function mapKdRound(src: EditorKdQuestionData | undefined): KdRound {
+type MediaNameResolver = (folder: MediaFolder, name: string | undefined) => string | undefined;
+const identityMediaResolver: MediaNameResolver = (_folder, name) => name;
+
+function mapKdRound(
+  src: EditorKdQuestionData | undefined,
+  resolveMedia: MediaNameResolver = identityMediaResolver,
+): KdRound {
   const { singleplayer, multiplayer } = splitKdPools(src);
   return {
     questions: {
-      singleplayer: singleplayer.map((pool) => pool.map(editorToKd)),
-      multiplayer: multiplayer.map(editorToKd),
+      singleplayer: singleplayer.map((pool) => pool.map((q) => editorToKd(q, resolveMedia))),
+      multiplayer: multiplayer.map((q) => editorToKd(q, resolveMedia)),
     },
     gamemode: 'S',
     activePlayerIndex: 0,
@@ -417,34 +622,44 @@ function splitKdPools(src: EditorKdQuestionData | undefined): {
   return { singleplayer: singleplayer ?? [], multiplayer: multiplayer ?? [] };
 }
 
-function editorToKd(q: EditorQuestion): KdQuestion {
+function editorToKd(q: EditorQuestion, resolveMedia: MediaNameResolver): KdQuestion {
+  const mediaFile = resolveMedia('kd', q.mediaSrcName);
   return {
     question: q.question,
     answer: q.answer,
     type: KD_TYPE_BY_EDITOR[q.type] ?? 'N',
-    ...(q.mediaSrcName ? { mediaFile: q.mediaSrcName } : {}),
+    ...(mediaFile ? { mediaFile } : {}),
   };
 }
 
-function mapVcnvRound(src: EditorVcnvQuestionData | undefined): VcnvRound {
+function mapVcnvRound(
+  src: EditorVcnvQuestionData | undefined,
+  obstaclePieceFiles?: string[],
+  resolveMedia: MediaNameResolver = identityMediaResolver,
+): VcnvRound {
   const rows = (src?.questions ?? [])
     .slice(0, VCNV_ROW_COUNT)
-    .map((q, index): VcnvQuestion => ({
-      id: index + 1,
-      type: 'HN',
-      value: DEFAULT_GAME_RULES.vcnvRowPoints,
-      isOpen: false,
-      isShown: false,
-      question: q.question,
-      answer: q.answer,
-      ...(q.mediaSrcName ? { imageFile: q.mediaSrcName } : {}),
-    }));
-  const obstacleImage = src?.cnvMediaSrcNames?.[0];
+    .map((q, index): VcnvQuestion => {
+      const imageFile = resolveMedia('vcnv', q.mediaSrcName);
+      return {
+        id: index + 1,
+        type: 'HN',
+        value: DEFAULT_GAME_RULES.vcnvRowPoints,
+        isOpen: false,
+        isShown: false,
+        question: q.question,
+        answer: q.answer,
+        ...(imageFile ? { imageFile } : {}),
+      };
+    });
+  const hasProtectedPieces = obstaclePieceFiles?.length === VCNV_PIECE_COUNT;
+  const obstacleImage = hasProtectedPieces ? undefined : resolveMedia('vcnv', src?.cnvMediaSrcNames?.[0]);
   const obstacle: VcnvObstacle = {
     value: DEFAULT_GAME_RULES.obstacleValueByRevealedCount[0],
     question: '',
     answer: src?.cnv ?? '',
     ...(obstacleImage ? { imageFile: obstacleImage } : {}),
+    ...(hasProtectedPieces ? { imagePieceFiles: obstaclePieceFiles } : {}),
   };
   return {
     questions: rows,
@@ -460,22 +675,28 @@ function mapVcnvRound(src: EditorVcnvQuestionData | undefined): VcnvRound {
   };
 }
 
-function mapTtRound(questions: EditorQuestion[]): TtRound {
+function mapTtRound(
+  questions: EditorQuestion[],
+  resolveMedia: MediaNameResolver = identityMediaResolver,
+): TtRound {
   return {
     questions: questions.map((q, index): TtQuestion => {
       const base = { id: index + 1, question: q.question, answer: q.answer };
+      const primary = resolveMedia('tt', q.mediaSrcName);
+      const secondary = resolveMedia('tt', q.secondaryMediaSrcName);
       if (q.type === EditorQuestionType.Video) {
         return {
           ...base,
           type: 'video',
-          ...(q.mediaSrcName ? { videoFile: q.mediaSrcName } : {}),
+          ...(primary ? { videoFile: primary } : {}),
+          ...(secondary ? { answerImage: secondary } : {}),
         };
       }
       return {
         ...base,
         type: 'image',
-        ...(q.mediaSrcName ? { questionImage: q.mediaSrcName } : {}),
-        ...(q.secondaryMediaSrcName ? { answerImage: q.secondaryMediaSrcName } : {}),
+        ...(primary ? { questionImage: primary } : {}),
+        ...(secondary ? { answerImage: secondary } : {}),
       };
     }),
     playerAnswers: Array.from({ length: PLAYER_COUNT }, (_, playerIndex) => ({
@@ -492,16 +713,22 @@ function mapTtRound(questions: EditorQuestion[]): TtRound {
   };
 }
 
-function mapVdRound(pools: EditorQuestion[][]): VdRound {
+function mapVdRound(
+  pools: EditorQuestion[][],
+  resolveMedia: MediaNameResolver = identityMediaResolver,
+): VdRound {
   return {
     questionPools: pools.map((pool) =>
-      pool.map((q): VdQuestion => ({
-        value: q.value,
-        type: VD_TYPE_BY_EDITOR[q.type] ?? 'N',
-        question: q.question,
-        answer: q.answer,
-        ...(q.mediaSrcName ? { mediaFile: q.mediaSrcName } : {}),
-      })),
+      pool.map((q): VdQuestion => {
+        const mediaFile = resolveMedia('vd', q.mediaSrcName);
+        return {
+          value: q.value,
+          type: VD_TYPE_BY_EDITOR[q.type] ?? 'N',
+          question: q.question,
+          answer: q.answer,
+          ...(mediaFile ? { mediaFile } : {}),
+        };
+      }),
     ),
     activePlayerIndex: 0,
     isQuestionPickerShown: false,

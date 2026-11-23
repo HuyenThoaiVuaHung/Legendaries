@@ -23,6 +23,8 @@ export interface GameRules {
 
   /** Points by finishing order for the Tăng tốc round (1st, 2nd, …). */
   ttPointsByPlacement: number[];
+  /** Thinking time in seconds for each Tăng tốc question (e.g. [20, 20, 30, 30] for O25/O26). */
+  ttQuestionSeconds: number[];
   /** Countdown while the Tăng tốc video question plays. */
   ttVideoSeconds: number;
 
@@ -45,9 +47,10 @@ export const DEFAULT_GAME_RULES: GameRules = {
   kdClockStartDelayMs: 1000,
 
   vcnvRowPoints: 10,
-  obstacleValueByRevealedCount: { 0: 50, 1: 50, 2: 40, 3: 30, 4: 20, 5: 10 },
+  obstacleValueByRevealedCount: { 0: 60, 1: 60, 2: 50, 3: 40, 4: 30, 5: 20 },
 
   ttPointsByPlacement: [40, 30, 20, 10],
+  ttQuestionSeconds: [20, 20, 30, 30],
   ttVideoSeconds: 30,
 
   vdStealTicks: 50,
@@ -72,7 +75,30 @@ export function loadGameRules(overrides?: Partial<GameRules>): GameRules {
   rules.ttPointsByPlacement = [
     ...(overrides?.ttPointsByPlacement ?? DEFAULT_GAME_RULES.ttPointsByPlacement),
   ];
+  rules.ttQuestionSeconds = [
+    ...(overrides?.ttQuestionSeconds ?? DEFAULT_GAME_RULES.ttQuestionSeconds),
+  ];
   return rules;
+}
+
+/** Major rule differences by Olympia season (23, 24, 25, 26). */
+export function rulesForMatchVersion(version: number): Partial<GameRules> {
+  if (version === 23) {
+    return {
+      obstacleValueByRevealedCount: { 0: 50, 1: 50, 2: 40, 3: 30, 4: 20, 5: 10 },
+      ttQuestionSeconds: [10, 20, 30, 40],
+    };
+  }
+  if (version === 24) {
+    return {
+      obstacleValueByRevealedCount: { 0: 60, 1: 60, 2: 50, 3: 40, 4: 30, 5: 20 },
+      ttQuestionSeconds: [10, 20, 30, 40],
+    };
+  }
+  return {
+    obstacleValueByRevealedCount: { 0: 60, 1: 60, 2: 50, 3: 40, 4: 30, 5: 20 },
+    ttQuestionSeconds: [20, 20, 30, 30],
+  };
 }
 
 interface NumericRuleConstraint {
@@ -95,7 +121,7 @@ export const TUNABLE_NUMBER_FIELDS = {
   chpTurnSeconds: { minimum: 1 },
   chpCorrectPoints: { minimum: 0 },
 } as const satisfies Record<
-  Exclude<keyof GameRules, 'playerCount' | 'obstacleValueByRevealedCount' | 'ttPointsByPlacement'>,
+  Exclude<keyof GameRules, 'playerCount' | 'obstacleValueByRevealedCount' | 'ttPointsByPlacement' | 'ttQuestionSeconds'>,
   NumericRuleConstraint
 >;
 
@@ -126,6 +152,18 @@ export function applyRuleOverrides(rules: GameRules, patch: Partial<GameRules>):
     if (valid) {
       rules.ttPointsByPlacement = [...points];
       changed.push('ttPointsByPlacement');
+    }
+  }
+
+  if (Array.isArray(patch.ttQuestionSeconds)) {
+    const seconds = patch.ttQuestionSeconds;
+    const valid =
+      seconds.length >= 1 &&
+      seconds.length <= 6 &&
+      seconds.every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 1);
+    if (valid) {
+      rules.ttQuestionSeconds = [...seconds];
+      changed.push('ttQuestionSeconds');
     }
   }
 

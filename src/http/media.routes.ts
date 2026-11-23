@@ -25,20 +25,13 @@ import { VCNV_PIECE_COUNT } from '../game.rules';
 import { Room } from '../rooms/room';
 import { DEFAULT_ROOM_ID } from '../rooms/room.registry';
 import { MediaStore } from '../services/media.store';
+import { safeMimeForFileName, validateMediaFile } from '../services/media-validation';
 import { publicConfig } from './config.routes';
 import { bearerToken, identityOf, param, requireAuth, roomOf } from './middleware';
 import type { ApiDeps } from './index';
 
 /** Round kinds plus the catch-all bucket for unclassified assets. */
 const MEDIA_KINDS: readonly string[] = [...ROUND_KINDS, 'misc'];
-
-const ALLOWED_MIME_PREFIXES: readonly string[] = ['image/', 'audio/', 'video/'];
-/** Extension allow-list — keeps html/svg/js out even with a spoofed mimetype. */
-const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
-  'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp',
-  'mp3', 'wav', 'ogg', 'm4a', 'flac',
-  'mp4', 'webm', 'mkv', 'mov',
-]);
 
 /** Fixed destinations keep overrides inside the recognised Legion brand set. */
 const BRAND_ASSET_PATHS: Readonly<Record<BrandAssetKey, string>> = {
@@ -58,9 +51,9 @@ export function createMediaRoutes(deps: ApiDeps): Router {
   const router = Router();
   const adminOnly = requireAuth(auth, Role.Admin);
   const anyRole = requireAuth(auth);
-  const serverAdmins = new Set(config.serverAdmins.map((name) => name.toLocaleLowerCase()));
-  // Hosted mode: server-wide branding belongs to the operators listed in
-  // config.serverAdmins, never to a room admin. Single venue: room admin.
+  const serverAdminIds = new Set(config.serverAdminIds);
+  // Hosted mode: server-wide branding belongs strictly to provisioned operator
+  // account IDs, never to username registration order or room admins.
   const brandGuard: RequestHandler = config.multiRoom
     ? (req, res, next) => {
         const identity = auth.verifyAccount(bearerToken(req));
@@ -70,7 +63,7 @@ export function createMediaRoutes(deps: ApiDeps): Router {
           res.status(401).json(error);
           return;
         }
-        if (!serverAdmins.has(account.username.toLocaleLowerCase())) {
+        if (!serverAdminIds.has(account.id)) {
           const error: ApiError = { error: 'Only server admins can change server-wide branding' };
           res.status(403).json(error);
           return;
@@ -89,12 +82,8 @@ export function createMediaRoutes(deps: ApiDeps): Router {
       badRequest(res, `Missing multipart field "${UPLOAD_FIELD}"`);
       return null;
     }
-    const extension = file.originalname.split('.').pop()?.toLowerCase() ?? '';
-    if (
-      !ALLOWED_MIME_PREFIXES.some((prefix) => file.mimetype.startsWith(prefix)) ||
-      !ALLOWED_EXTENSIONS.has(extension)
-    ) {
-      const error: ApiError = { error: `Unsupported media type: ${file.mimetype} (.${extension})` };
+    if (!validateMediaFile(file.originalname, file.buffer, { claimedMime: file.mimetype })) {
+      const error: ApiError = { error: `Unsupported or invalid media file: ${file.originalname}` };
       res.status(415).json(error);
       return null;
     }
@@ -105,10 +94,12 @@ export function createMediaRoutes(deps: ApiDeps): Router {
     req: import('express').Request,
     res: Response,
   ): Express.Multer.File | null => {
-    const file = validateUpload(req, res);
-    if (!file) return null;
-    const extension = file.originalname.split('.').pop()?.toLowerCase();
-    if (file.mimetype !== 'image/png' || extension !== 'png') {
+    const file = req.file;
+    if (!file) {
+      badRequest(res, `Missing multipart field "${UPLOAD_FIELD}"`);
+      return null;
+    }
+    if (!validateMediaFile(file.originalname, file.buffer, { pngOnly: true, claimedMime: file.mimetype })) {
       const error: ApiError = { error: 'Ảnh phải là PNG.' };
       res.status(415).json(error);
       return null;
@@ -127,10 +118,13 @@ export function createMediaRoutes(deps: ApiDeps): Router {
     return true;
   };
 
-  const mediaUrl = (room: Room, kind: RoundKind | 'misc', fileName: string): string =>
-    room.id === DEFAULT_ROOM_ID
-      ? API_PATHS.mediaFile(kind, fileName)
-      : API_PATHS.roomMediaFile(room.id, kind, fileName);
+  const mediaUrl = (room: Room, kind: RoundKind | 'misc', fileName: string): string => {
+    const path =
+      room.id === DEFAULT_ROOM_ID
+        ? API_PATHS.mediaFile(kind, fileName)
+        : API_PATHS.roomMediaFile(room.id, kind, fileName);
+    return config.mediaOrigin ? `${config.mediaOrigin}${path}` : path;
+  };
 
   const exceedsQuota = (room: Room, file: Express.Multer.File, res: Response): boolean => {
     if (file.buffer.length <= room.quotaRemaining(config.roomMediaQuotaBytes)) return false;
@@ -152,9 +146,9 @@ export function createMediaRoutes(deps: ApiDeps): Router {
     }
     upload.single(UPLOAD_FIELD)(req, res, (err: unknown) => {
       if (handleMulterError(err, res)) return;
+      if (req.file && exceedsQuota(room, req.file, res)) return;
       const file = validateUpload(req, res);
       if (!file) return;
-      if (exceedsQuota(room, file, res)) return;
       const saved = room.media.save(kind, file.originalname, file.buffer);
       const response: MediaUploadResponse = {
         fileName: saved.fileName,
@@ -172,10 +166,10 @@ export function createMediaRoutes(deps: ApiDeps): Router {
     }
     upload.single(UPLOAD_FIELD)(req, res, (err: unknown) => {
       if (handleMulterError(err, res)) return;
+      const room = roomOf(req);
+      if (req.file && exceedsQuota(room, req.file, res)) return;
       const file = validateBrandAssetUpload(req, res);
       if (!file) return;
-      const room = roomOf(req);
-      if (exceedsQuota(room, file, res)) return;
       const ui = room.ui.get();
       ui.miscImageSrcNames[slot] = room.media.save('misc', file.originalname, file.buffer).fileName;
       room.ui.set(ui);
@@ -230,9 +224,9 @@ export function createMediaRoutes(deps: ApiDeps): Router {
     const room = roomOf(req);
     upload.single(UPLOAD_FIELD)(req, res, (err: unknown) => {
       if (handleMulterError(err, res)) return;
+      if (req.file && exceedsQuota(room, req.file, res)) return;
       const file = validateUpload(req, res);
       if (!file) return;
-      if (exceedsQuota(room, file, res)) return;
       const fileName = room.media.saveObstaclePiece(file.originalname, file.buffer);
       const response: MediaUploadResponse = {
         fileName,
@@ -241,6 +235,13 @@ export function createMediaRoutes(deps: ApiDeps): Router {
       res.json(response);
     });
   });
+
+  const applySafeMediaHeaders = (res: Response, mime: string): void => {
+    res.setHeader('Content-Type', mime);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  };
 
   // Reveal-gated obstacle piece: piece i is served only once VCNV row i is
   // open, so players cannot reassemble the hidden obstacle early. Admin and MC
@@ -262,12 +263,13 @@ export function createMediaRoutes(deps: ApiDeps): Router {
     }
     const fileName = round.obstacle.imagePieceFiles?.[index];
     const path = fileName ? room.media.resolveObstaclePiece(fileName) : undefined;
-    if (path === undefined) {
+    const mime = path ? safeMimeForFileName(path) : null;
+    if (path === undefined || mime === null) {
       const error: ApiError = { error: 'Obstacle piece not found' };
       res.status(404).json(error);
       return;
     }
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+    applySafeMediaHeaders(res, mime);
     res.setHeader('Cache-Control', 'no-store');
     res.sendFile(path);
   });
@@ -281,14 +283,13 @@ export function createMediaRoutes(deps: ApiDeps): Router {
       return;
     }
     const path = media.resolve(param(req, 'kind'), param(req, 'name'));
-    if (path === undefined) {
+    const mime = path ? safeMimeForFileName(path) : null;
+    if (path === undefined || mime === null) {
       const error: ApiError = { error: 'Media not found' };
       res.status(404).json(error);
       return;
     }
-    // Media is user-uploaded: never let the browser sniff it into an
-    // executable same-origin document.
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+    applySafeMediaHeaders(res, mime);
     res.sendFile(resolve(path));
   };
 

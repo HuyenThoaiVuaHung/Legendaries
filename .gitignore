@@ -135,7 +135,12 @@ tempCodeRunnerFile.js
 
 # Runtime match state (generated at runtime; fixtures stay tracked)
 match_data/match.json
+match_data/ui.json
+match_data/accounts.json
+match_data/sessions.json
 match_data/media/
+match_data/rooms/
+match_data/bank/
 match_data/round_data/imported_*.json
 match_data/round_data/kd.json
 match_data/round_data/vcnv.json

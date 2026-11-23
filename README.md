@@ -20,6 +20,8 @@ Useful runtime configuration is loaded from `utils/config.json` and can be overr
 
 The server writes mutable match state, media, and user asset overrides under `match_data/`. Keep that directory on persistent storage in production. Do not use the default player/admin secrets or a random per-boot JWT secret in a production deployment; set them explicitly through protected configuration.
 
+Hosted question-bank uploads default to files under `match_data/bank/media/`. Keep this directory private and back it up together with the bank database. Set `LEGENDARY_BANKMEDIASTORAGE=sqlite` to store new uploads in the database instead. Changing the setting affects only new uploads. Existing uploads remain readable from their original storage.
+
 ## Build
 
 ```bash

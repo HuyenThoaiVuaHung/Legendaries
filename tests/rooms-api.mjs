@@ -35,15 +35,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 if (stage === 'persist-create') {
   const h = await call('/api/accounts', { method: 'POST', body: { username: `p2p${Date.now().toString(36)}`, password: 'phase-two-pass' } });
   const c = await call('/api/rooms', { method: 'POST', token: h.body.token });
-  const p = await join_(c.body.code, c.body.secrets.player, 'Persisted');
+  const p = await join_(c.body.code, c.body.secrets.players[2]);
   await call('/api/config', { token: c.body.token, method: 'PATCH', body: { kdCorrectPoints: 77 } });
   console.log(JSON.stringify({ code: c.body.code, secrets: c.body.secrets, seat: p.body.index, roomId: c.body.roomId }));
   process.exitCode = 0;
 } else if (stage === 'persist-verify') {
   const saved = JSON.parse(stageArg);
-  const again = await join_(saved.code, saved.secrets.player, 'persisted');
+  const again = await join_(saved.code, saved.secrets.players[2]);
   check('room survives restart (join by code)', again.status === 200, JSON.stringify(again.body));
-  check('seat survives restart', again.body.index === saved.seat, `${again.body.index} vs ${saved.seat}`);
+  check('player code maps to same seat after restart', again.body.index === saved.seat, `${again.body.index} vs ${saved.seat}`);
   const admin = await join_(saved.code, saved.secrets.admin);
   const cfg = await call('/api/config', { token: admin.body.token });
   check('room rules survive restart', cfg.body.rules?.kdCorrectPoints === 77, JSON.stringify(cfg.body.rules?.kdCorrectPoints));
@@ -57,7 +57,7 @@ const HOST = hostSignup.body.token;
 const created = await call('/api/rooms', { method: 'POST', token: HOST });
 const A = created.body;
 check('create room → 201 with code, secrets, admin token',
-  created.status === 201 && /^[A-Z2-9]{6}$/.test(A.code) && A.secrets?.player && A.token && A.roleId === 1,
+  created.status === 201 && /^[A-Z2-9]{6}$/.test(A.code) && Array.isArray(A.secrets?.players) && A.secrets.players.length === 4 && A.token && A.roleId === 1,
   JSON.stringify(created));
 
 // ---------------------------------------------------------------- join
@@ -66,15 +66,15 @@ check('join without secret → spectator (code case-insensitive)', spectator.sta
 check('wrong secret → 401', (await join_(A.code, 'nope')).status === 401);
 check('unknown code → 404', (await join_('ZZZZZZ')).status === 404);
 
-const alice = await join_(A.code, A.secrets.player, 'Alice');
-const bob = await join_(A.code, A.secrets.player, 'Bob');
-const alice2 = await post_join_with(A.code, A.secrets.player, 'ALICE', alice.body.token);
-check('first player gets seat 0', alice.body.roleId === 0 && alice.body.index === 0, JSON.stringify(alice.body));
-check('second player gets seat 1', bob.body.index === 1, JSON.stringify(bob.body));
-check('own session reclaims seat (case-insensitive)', alice2.body.index === 0, JSON.stringify(alice2.body));
-await join_(A.code, A.secrets.player, 'Carol');
-await join_(A.code, A.secrets.player, 'Dave');
-check('fifth player → 409 seats full', (await join_(A.code, A.secrets.player, 'Eve')).status === 409);
+const p0 = await join_(A.code, A.secrets.players[0]);
+const p1 = await join_(A.code, A.secrets.players[1]);
+const p0Again = await join_(A.code, A.secrets.players[0]);
+check('player 1 code maps to seat 0', p0.body.roleId === 0 && p0.body.index === 0, JSON.stringify(p0.body));
+check('player 2 code maps to seat 1', p1.body.roleId === 0 && p1.body.index === 1, JSON.stringify(p1.body));
+check('re-joining with same player code reconnects to seat 0', p0Again.status === 200 && p0Again.body.index === 0, JSON.stringify(p0Again.body));
+const p2 = await join_(A.code, A.secrets.players[2]);
+const p3 = await join_(A.code, A.secrets.players[3]);
+check('player 3 and 4 codes map to seats 2 and 3', p2.body.index === 2 && p3.body.index === 3);
 check('mc secret → MC', (await join_(A.code, A.secrets.mc)).body.roleId === 2);
 check('admin secret → admin', (await join_(A.code, A.secrets.admin)).body.roleId === 1);
 

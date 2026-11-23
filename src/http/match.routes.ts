@@ -8,7 +8,6 @@
  */
 import { Request, Response, Router } from 'express';
 import multer from 'multer';
-import type { RoomChannel } from '../rooms/room';
 import {
   API_PATHS,
   ApiError,
@@ -19,7 +18,6 @@ import {
   UpdatePlayerRequest,
 } from '../contracts/api';
 import {
-  KdRound,
   MATCH_POSITIONS,
   MatchPosition,
   Player,
@@ -31,40 +29,21 @@ import {
 import { GameRules, PLAYER_COUNT, VCNV_ROW_COUNT } from '../game.rules';
 import { LogLevel } from '../logger';
 import { ExcelImportService } from '../services/excel-import.service';
-import { QuotaError } from '../services/legion-file.service';
+import {
+  ArchiveBusyError,
+  ArchiveLimitError,
+  QuotaError,
+  UnsupportedMediaError,
+} from '../services/legion-file.service';
+import { buildLiveStateSnapshot, emitRoundUpdate, sanitizeRoundForRole } from '../services/round-view';
 import { publicConfig } from './config.routes';
 import { identityOf, param, requireAuth, roomOf } from './middleware';
 import type { ApiDeps } from './index';
 
-/** Socket push event per round kind (wire names kept from the old server). */
-const ROUND_UPDATE_EVENTS: Readonly<Record<RoundKind, string>> = {
-  kd: 'update-kd-data-admin',
-  vcnv: 'update-vcnv-data',
-  tt: 'update-tangtoc-data',
-  vd: 'update-vedich-data',
-  chp: 'update-chp-data',
-};
-/** KD push for non-admin clients: same round, questions stripped. */
-const KD_PUBLIC_UPDATE_EVENT = 'update-kd-data';
 const KD_GAMEMODE_EVENT = 'update-kd-gamemode';
 const MATCH_UPDATE_EVENT = 'update-match-data';
 
 const KD_GAMEMODES: readonly string[] = ['S', 'M'];
-
-/** What non-admin clients may see of the KD round (old get-kd-data). */
-function stripKdQuestions(kd: KdRound): Omit<KdRound, 'questions'> {
-  const { questions, ...rest } = kd;
-  void questions;
-  return rest;
-}
-
-/** Emit the push event(s) for one round; KD gets its admin + public pair. */
-function emitRoundUpdate(io: RoomChannel, kind: RoundKind, data: RoundData): void {
-  io.emit(ROUND_UPDATE_EVENTS[kind], data);
-  if (kind === 'kd') {
-    io.emit(KD_PUBLIC_UPDATE_EVENT, stripKdQuestions(data as KdRound));
-  }
-}
 
 /**
  * Old update-vcnv-data rule: the obstacle's value is derived from how many
@@ -109,6 +88,12 @@ export function createMatchRoutes(deps: ApiDeps): Router {
     res.json(room.store.getMatch());
   });
 
+  router.get(API_PATHS.matchLiveState, anyAuthed, (req, res) => {
+    const room = roomOf(req);
+    const identity = identityOf(req);
+    res.json(buildLiveStateSnapshot(room, identity.roleId));
+  });
+
   router.patch(API_PATHS.matchPosition, adminOnly, (req, res) => {
     const room = roomOf(req);
     const { position } = (req.body ?? {}) as UpdateMatchPositionRequest;
@@ -116,10 +101,31 @@ export function createMatchRoutes(deps: ApiDeps): Router {
       badRequest(res, `Invalid match position: ${String(position)}`);
       return;
     }
+    const previous = room.store.getMatch().position;
+    if (previous !== position) {
+      room.session.activeLoopSfx = null;
+      room.session.activeTimedSfx = null;
+      const now = Date.now();
+      room.channel.emit('video-state', {
+        target: 'tt',
+        state: room.session.resetVideoPlayback('tt'),
+        serverTime: now,
+      });
+      room.channel.emit('video-state', {
+        target: 'vd',
+        state: room.session.resetVideoPlayback('vd'),
+        serverTime: now,
+      });
+    }
     const match = room.store.updateMatch((m) => {
       m.position = position as MatchPosition;
     });
     room.channel.emit(MATCH_UPDATE_EVENT, match);
+    if (match.position === 'VCNV_A') {
+      emitRoundUpdate(room, 'vcnv', room.store.round('vcnv').get());
+    } else if (match.position === 'TT_A') {
+      emitRoundUpdate(room, 'tt', room.store.round('tt').get());
+    }
     res.json(match);
   });
 
@@ -152,11 +158,16 @@ export function createMatchRoutes(deps: ApiDeps): Router {
       return;
     }
     const data = room.store.round(kind).get();
-    if (kind === 'kd' && identityOf(req).roleId !== Role.Admin) {
-      res.json(stripKdQuestions(data as KdRound));
-      return;
-    }
-    res.json(data);
+    const identity = identityOf(req);
+    res.json(
+      sanitizeRoundForRole(
+        kind,
+        data as never,
+        identity.roleId,
+        room.store.getMatch().position,
+        identity.index,
+      ),
+    );
   });
 
   router.put('/api/rounds/:kind', adminOnly, (req, res) => {
@@ -175,7 +186,7 @@ export function createMatchRoutes(deps: ApiDeps): Router {
       recomputeObstacleValue(payload as VcnvRound, room.rules);
     }
     const data = room.store.round(kind).set(payload);
-    emitRoundUpdate(room.channel, kind, data);
+    emitRoundUpdate(room, kind, data);
     res.json(data);
   });
 
@@ -203,7 +214,7 @@ export function createMatchRoutes(deps: ApiDeps): Router {
       if (gamemode !== undefined) kd.gamemode = gamemode;
       if (activePlayerIndex !== undefined) kd.activePlayerIndex = activePlayerIndex;
     });
-    emitRoundUpdate(room.channel, 'kd', data);
+    emitRoundUpdate(room, 'kd', data);
     if (gamemode !== undefined) room.channel.emit(KD_GAMEMODE_EVENT, gamemode);
     res.json(data);
   });
@@ -220,7 +231,7 @@ export function createMatchRoutes(deps: ApiDeps): Router {
       const rounds = new ExcelImportService(room.store).import(req.body);
       for (const kind of ROUND_KINDS) {
         const data = room.store.round(kind).set(rounds[kind]);
-        emitRoundUpdate(room.channel, kind, data);
+        emitRoundUpdate(room, kind, data);
       }
       res.json(rounds);
     } catch (err) {
@@ -251,7 +262,7 @@ export function createMatchRoutes(deps: ApiDeps): Router {
           room.channel.emit('update-config', publicConfig(room, config));
           room.channel.emit(MATCH_UPDATE_EVENT, room.store.getMatch());
           for (const kind of ROUND_KINDS) {
-            emitRoundUpdate(room.channel, kind, room.store.round(kind).get());
+            emitRoundUpdate(room, kind, room.store.round(kind).get());
           }
           res.json(result);
         } catch (importErr) {
@@ -260,8 +271,24 @@ export function createMatchRoutes(deps: ApiDeps): Router {
             res.status(413).json(error);
             return;
           }
+          if (importErr instanceof ArchiveLimitError) {
+            const error: ApiError = { error: importErr.message };
+            res.status(413).json(error);
+            return;
+          }
+          if (importErr instanceof UnsupportedMediaError) {
+            const error: ApiError = { error: importErr.message };
+            res.status(415).json(error);
+            return;
+          }
+          if (importErr instanceof ArchiveBusyError) {
+            res.setHeader('Retry-After', '5');
+            const error: ApiError = { error: importErr.message };
+            res.status(429).json(error);
+            return;
+          }
           log(importErr, LogLevel.Error);
-          serverError(res, importErr);
+          badRequest(res, importErr instanceof Error ? importErr.message : String(importErr));
         }
       });
     },

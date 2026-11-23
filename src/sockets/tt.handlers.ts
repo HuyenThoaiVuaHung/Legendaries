@@ -14,8 +14,9 @@ import { Role } from '../contracts/api';
 import { TtAnswer } from '../contracts/game';
 import { PLAYER_COUNT } from '../game.rules';
 import { LogLevel } from '../logger';
+import { emitRoundUpdate, sanitizeTtQuestion, sanitizeTtRound } from '../services/round-view';
 import { NO_PLAYER } from '../state/game.state';
-import { HandlerContext, isAdmin } from './context';
+import { HandlerContext, isAdmin, isStaff, safeOn } from './context';
 
 /** Sentinel the admin UI sends to clear the broadcast question. */
 const NO_QUESTION_ID = -1;
@@ -45,67 +46,116 @@ function resolvePlayerIndex(ctx: HandlerContext): number {
 }
 
 export function registerTtHandlers(ctx: HandlerContext): void {
-  const { io, socket, store, log, rules } = ctx;
+  const { io, room, socket, store, timer, log, rules } = ctx;
   const tt = store.round('tt');
 
-  socket.on('player-submit-answer-tangtoc', (answer: string) => {
+  safeOn(ctx, 'player-submit-answer-tangtoc', (answer: unknown) => {
     const playerIndex = resolvePlayerIndex(ctx);
-    if (playerIndex === NO_PLAYER) {
+    if (playerIndex === NO_PLAYER || playerIndex < 0 || playerIndex >= PLAYER_COUNT) {
       log(`Socket ${socket.id} submitted a TT answer but is not a player`, LogLevel.Error);
+      return;
+    }
+    if (typeof answer !== 'string' || answer.length > 500) return;
+    const position = store.getMatch().position;
+    const current = tt.get();
+    if (
+      !timer.isRunning() ||
+      current.showResults ||
+      current.showAnswer ||
+      position === 'TT_A' ||
+      current.activeQuestionIndex < 0
+    ) {
       return;
     }
     const timestamp = Date.now();
     const data = tt.update((d) => {
       const entry = d.playerAnswers[playerIndex];
+      if (!entry) return;
       entry.answer = answer;
       entry.timestamp = timestamp;
       entry.readableTime = formatReadableTime(timestamp);
     });
-    io.emit('update-tangtoc-data', data);
+    room.staffChannel.emit('update-tangtoc-data', data);
+    socket.emit('update-tangtoc-data', sanitizeTtRound(data, position, playerIndex));
+    socket.to(`${room.id}:public`).emit('update-tangtoc-data', sanitizeTtRound(data, position));
   });
 
-  socket.on('update-timer-start-timestamp', () => {
+  safeOn(ctx, 'update-timer-start-timestamp', () => {
+    if (!isAdmin(ctx)) return;
     const data = tt.update((d) => {
       d.timerStartTimestamp = Date.now() + rules.mainClockTickMs;
     });
-    io.emit('update-tangtoc-data', data);
+    emitRoundUpdate(room, 'tt', data);
   });
 
-  socket.on('submit-mark-tangtoc-admin', () => {
+  safeOn(ctx, 'submit-mark-tangtoc-admin', () => {
     if (!isAdmin(ctx)) return;
-    // Rank answers by submission time; each correct answer earns the points
-    // for its placement (fastest correct first). Sort a copy — the stored
-    // answer order stays per-player, as the old per-event file reload did.
     const ranked = [...tt.get().playerAnswers].sort(byTimestamp);
     const match = store.updateMatch((m) => {
       let placement = 0;
+      let lastTimestamp: number | null = null;
+      let lastPoints = 0;
       for (const answer of ranked) {
         if (answer.correct !== true) continue;
-        const points = rules.ttPointsByPlacement[placement] ?? 0;
-        m.players[answer.playerIndex].score += points;
-        log(`Player ${m.players[answer.playerIndex].name} got ${points} points`);
+        const player = m.players[answer.playerIndex];
+        if (!player) continue;
+        const points =
+          lastTimestamp !== null && answer.timestamp === lastTimestamp
+            ? lastPoints
+            : (rules.ttPointsByPlacement[placement] ?? 0);
+        lastTimestamp = answer.timestamp;
+        lastPoints = points;
+        player.score += points;
+        log(`Player ${player.name} got ${points} points`);
         placement++;
       }
     });
     io.emit('update-match-data', match);
   });
 
-  socket.on('toggle-results-display-tangtoc', () => {
+  safeOn(ctx, 'toggle-results-display-tangtoc', () => {
+    if (!isAdmin(ctx)) return;
     const data = tt.update((d) => {
       d.showResults = !d.showResults;
     });
-    io.emit('update-tangtoc-data', data);
+    emitRoundUpdate(room, 'tt', data);
   });
 
-  socket.on('broadcast-tt-question', (questionId: number) => {
+  safeOn(ctx, 'broadcast-tt-question', (questionId: unknown) => {
+    if (!isStaff(ctx)) return;
+    if (typeof questionId !== 'number' || !Number.isInteger(questionId)) return;
+    const resetVideo = ctx.session.resetVideoPlayback('tt');
+    io.emit('video-state', { target: 'tt', state: resetVideo, serverTime: Date.now() });
     if (questionId !== NO_QUESTION_ID) {
-      io.emit('update-tangtoc-question', tt.get().questions[questionId - 1]);
+      const current = tt.get();
+      const index = current.questions.findIndex((item) => item.id === questionId);
+      const resolvedIndex = index >= 0 ? index : questionId - 1;
+      const q = current.questions[resolvedIndex];
+      if (!q) {
+        const cleared = tt.update((d) => {
+          d.activeQuestionIndex = NO_QUESTION_ID;
+        });
+        emitRoundUpdate(room, 'tt', cleared);
+        io.emit('update-tangtoc-question', undefined);
+        return;
+      }
+      const updated = tt.update((d) => {
+        d.activeQuestionIndex = resolvedIndex;
+      });
+      emitRoundUpdate(room, 'tt', updated);
+      room.staffChannel.emit('update-tangtoc-question', q);
+      room.publicChannel.emit('update-tangtoc-question', sanitizeTtQuestion(q, updated.showAnswer));
     } else {
+      const cleared = tt.update((d) => {
+        d.activeQuestionIndex = NO_QUESTION_ID;
+      });
+      emitRoundUpdate(room, 'tt', cleared);
       io.emit('update-tangtoc-question', undefined);
     }
   });
 
-  socket.on('clear-answer-tt', () => {
+  safeOn(ctx, 'clear-answer-tt', () => {
+    if (!isAdmin(ctx)) return;
     const data = tt.update((d) => {
       d.playerAnswers = Array.from(
         { length: PLAYER_COUNT },
@@ -118,10 +168,14 @@ export function registerTtHandlers(ctx: HandlerContext): void {
         }),
       );
     });
-    io.emit('update-tangtoc-data', data);
+    emitRoundUpdate(room, 'tt', data);
   });
 
-  socket.on('tangtoc-play-video', () => {
+  safeOn(ctx, 'tangtoc-play-video', () => {
+    if (!isStaff(ctx)) return;
+    const now = Date.now();
+    const state = ctx.session.applyVideoControl('tt', { target: 'tt', action: 'toggle' }, now);
+    io.emit('video-state', { target: 'tt', state, serverTime: now });
     io.emit('tangtoc-play-video');
   });
 }

@@ -42,6 +42,7 @@ export interface Session {
 export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly lastPersistedTouch = new Map<string, number>();
+  private readonly revokeListeners = new Set<(revoked: ReadonlySet<string>) => void>();
 
   constructor(
     private readonly path: string,
@@ -54,6 +55,16 @@ export class SessionStore {
     setInterval(() => this.sweep(), SWEEP_INTERVAL_MS).unref();
   }
 
+  onRevoke(listener: (revoked: ReadonlySet<string>) => void): () => void {
+    this.revokeListeners.add(listener);
+    return () => this.revokeListeners.delete(listener);
+  }
+
+  private notifyRevoked(revoked: ReadonlySet<string>): void {
+    if (revoked.size === 0) return;
+    for (const listener of this.revokeListeners) listener(revoked);
+  }
+
   /** Create a session; returns the bearer token (shown to the client once). */
   create(session: NewSession): string {
     const token = randomBytes(TOKEN_BYTES).toString('base64url');
@@ -64,8 +75,8 @@ export class SessionStore {
   }
 
   /** The live session for a token, refreshing its idle timer; else null. */
-  get(token?: string): Session | null {
-    if (!token) return null;
+  get(token?: unknown): Session | null {
+    if (typeof token !== 'string' || token.length === 0) return null;
     const id = hashToken(token);
     const record = this.sessions.get(id);
     if (!record) return null;
@@ -73,6 +84,7 @@ export class SessionStore {
     if (this.isExpired(record, now)) {
       this.sessions.delete(id);
       this.persist();
+      this.notifyRevoked(new Set([id]));
       return null;
     }
     record.lastSeenAt = now;
@@ -83,9 +95,26 @@ export class SessionStore {
     return { id, record };
   }
 
+  /** True when a session id still exists and has not expired. */
+  isAlive(id: string): boolean {
+    const record = this.sessions.get(id);
+    if (!record) return false;
+    const now = this.now();
+    if (this.isExpired(record, now)) {
+      this.sessions.delete(id);
+      this.persist();
+      this.notifyRevoked(new Set([id]));
+      return false;
+    }
+    return true;
+  }
+
   revoke(id: string): boolean {
     const existed = this.sessions.delete(id);
-    if (existed) this.persist();
+    if (existed) {
+      this.persist();
+      this.notifyRevoked(new Set([id]));
+    }
     return existed;
   }
 
@@ -96,7 +125,10 @@ export class SessionStore {
       if (predicate(record, id)) revoked.add(id);
     }
     for (const id of revoked) this.sessions.delete(id);
-    if (revoked.size > 0) this.persist();
+    if (revoked.size > 0) {
+      this.persist();
+      this.notifyRevoked(revoked);
+    }
     return revoked;
   }
 
@@ -124,9 +156,9 @@ export class SessionStore {
 
   /** Write-then-rename, so a crash mid-write never truncates the file. */
   private persist(): void {
-    mkdirSync(dirname(this.path), { recursive: true });
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.sessions)));
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.sessions)), { mode: 0o600 });
     renameSync(tmp, this.path);
   }
 }

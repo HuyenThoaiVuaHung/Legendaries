@@ -35,6 +35,7 @@ export interface Account {
   username: string;
   passwordHash: string;
   recoveryHash: string;
+  credentialVersion: number;
   createdAt: number;
 }
 
@@ -94,6 +95,7 @@ function safeEqualHex(a: string, b: string): boolean {
 
 export class AccountStore {
   private readonly accounts = new Map<string, Account>();
+  private readonly recovering = new Set<string>();
   /** A real hash to compare against for unknown usernames (equal timing). */
   private dummyHash?: Promise<string>;
 
@@ -116,6 +118,30 @@ export class AccountStore {
     return undefined;
   }
 
+  searchUsernames(prefix: string, limit: number): string[] {
+    const query = prefix.toLowerCase();
+    const matches: string[] = [];
+    for (const { username } of this.accounts.values()) {
+      if (!username.toLowerCase().startsWith(query)) continue;
+      matches.push(username);
+      if (matches.length >= limit) break;
+    }
+    return matches;
+  }
+
+  /** Ensure a provisioned operator account exists and return its stable account ID. */
+  async ensureOperator(username: string, password: string): Promise<Account> {
+    const existing = this.byUsername(username);
+    if (existing) return existing;
+    const created = await this.create(username, password);
+    if (!created) {
+      const raced = this.byUsername(username);
+      if (raced) return raced;
+      throw new Error(`Could not provision operator account "${username}"`);
+    }
+    return created.account;
+  }
+
   /** Create an account; null when the username is taken. */
   async create(username: string, password: string): Promise<{ account: Account; recoveryCode: string } | null> {
     if (this.byUsername(username)) return null;
@@ -125,6 +151,7 @@ export class AccountStore {
       username,
       passwordHash: await hashPassword(password),
       recoveryHash: hashRecoveryCode(recoveryCode),
+      credentialVersion: 0,
       createdAt: Date.now(),
     };
     // Re-check after the await: two signups for one name may race.
@@ -134,7 +161,7 @@ export class AccountStore {
     return { account, recoveryCode };
   }
 
-  /** The account when username + password match; else null. */
+  /** The account when username + password match and credentials did not rotate in flight; else null. */
   async verifyPassword(username: string, password: string): Promise<Account | null> {
     const account = this.byUsername(username);
     if (!account) {
@@ -143,28 +170,45 @@ export class AccountStore {
       await passwordMatches(password, await this.dummyHash);
       return null;
     }
-    return (await passwordMatches(password, account.passwordHash)) ? account : null;
+    const versionBefore = account.credentialVersion;
+    const matched = await passwordMatches(password, account.passwordHash);
+    if (!matched || account.credentialVersion !== versionBefore) return null;
+    return account;
   }
 
   /**
    * Reset the password with the recovery code. The code is single-use: a
-   * fresh one is issued and returned. Null when the name or code is wrong.
+   * fresh one is issued and returned. Null when the name or code is wrong,
+   * or when another recovery for this account is already in flight.
    */
   async recover(username: string, recoveryCode: string, newPassword: string): Promise<{ account: Account; recoveryCode: string } | null> {
     const account = this.byUsername(username);
-    if (!account || !safeEqualHex(hashRecoveryCode(recoveryCode), account.recoveryHash)) return null;
-    const fresh = newRecoveryCode();
-    account.passwordHash = await hashPassword(newPassword);
-    account.recoveryHash = hashRecoveryCode(fresh);
-    this.persist();
-    return { account, recoveryCode: fresh };
+    if (!account || this.recovering.has(account.id)) return null;
+    if (!safeEqualHex(hashRecoveryCode(recoveryCode), account.recoveryHash)) return null;
+    this.recovering.add(account.id);
+    try {
+      const fresh = newRecoveryCode();
+      const newHash = await hashPassword(newPassword);
+      account.passwordHash = newHash;
+      account.recoveryHash = hashRecoveryCode(fresh);
+      account.credentialVersion += 1;
+      this.persist();
+      return { account, recoveryCode: fresh };
+    } finally {
+      this.recovering.delete(account.id);
+    }
   }
 
   private load(): void {
     if (!existsSync(this.path)) return;
     try {
       const raw = JSON.parse(readFileSync(this.path, 'utf8')) as Account[];
-      for (const account of raw) this.accounts.set(account.id, account);
+      for (const account of raw) {
+        this.accounts.set(account.id, {
+          ...account,
+          credentialVersion: typeof account.credentialVersion === 'number' ? account.credentialVersion : 0,
+        });
+      }
     } catch (err) {
       // Refuse to silently start empty: that would let names be re-registered.
       this.log(`Accounts file is unreadable: ${String(err)}`, LogLevel.Error);
@@ -173,9 +217,9 @@ export class AccountStore {
   }
 
   private persist(): void {
-    mkdirSync(dirname(this.path), { recursive: true });
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify([...this.accounts.values()], null, 2));
+    writeFileSync(tmp, JSON.stringify([...this.accounts.values()], null, 2), { mode: 0o600 });
     renameSync(tmp, this.path);
   }
 }

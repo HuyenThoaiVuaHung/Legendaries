@@ -26,8 +26,6 @@ export interface RoomMeta {
   /** Shown in the public room list (GET /api/rooms/public). */
   listed: boolean;
   links: (RoomLink & { tokenHash: string })[];
-  /** Username holding each player seat, in seat order; null when free. */
-  seats: (string | null)[];
   /** The room's live rules; persisted so settings survive a restart. */
   rules: GameRules;
   createdAt: number;
@@ -37,6 +35,8 @@ export interface RoomMeta {
 /** Everything one match owns. One instance per room. */
 export class Room {
   readonly channel: RoomChannel;
+  readonly staffChannel: RoomChannel;
+  readonly publicChannel: RoomChannel;
   readonly session = new GameSessionState();
   readonly timer: TimerService;
   readonly legionFiles: LegionFileService;
@@ -52,7 +52,12 @@ export class Room {
     readonly meta?: RoomMeta,
   ) {
     this.channel = io.to(id);
-    this.timer = new TimerService(this.channel, store, rules);
+    this.staffChannel = io.to(`${id}:staff`);
+    this.publicChannel = io.to(`${id}:public`);
+    this.timer = new TimerService(this.channel, store, rules, () => {
+      this.session.kdBuzzerOpen = false;
+      this.session.chpBuzzerOpen = false;
+    });
     this.legionFiles = new LegionFileService(store, media, ui);
   }
 
@@ -71,34 +76,6 @@ export class Room {
   quotaRemaining(quotaBytes: number): number {
     if (!this.meta || quotaBytes === 0) return Infinity;
     return Math.max(0, quotaBytes - this.media.usageBytes());
-  }
-
-  /**
-   * Seat held by `username` (case-insensitive), or -1. Holding a seat is not
-   * proof of identity: only the session that holds it may reclaim it.
-   * Only created rooms have seats; the default room uses per-seat secrets.
-   */
-  seatOf(username: string): number {
-    if (!this.meta) return -1;
-    const key = username.toLocaleLowerCase();
-    return this.meta.seats.findIndex((seat) => seat?.toLocaleLowerCase() === key);
-  }
-
-  /** Give `username` the first free seat; null when every seat is taken. */
-  claimFreeSeat(username: string): number | null {
-    if (!this.meta) return null;
-    const free = this.meta.seats.indexOf(null);
-    if (free === -1) return null;
-    this.meta.seats[free] = username;
-    return free;
-  }
-
-  /** Free a seat; returns the username that held it, if any. */
-  releaseSeat(index: number): string | null {
-    if (!this.meta || index < 0 || index >= this.meta.seats.length) return null;
-    const holder = this.meta.seats[index] ?? null;
-    this.meta.seats[index] = null;
-    return holder;
   }
 
   /** Stop every timer the room owns, silently; used when closing it. */

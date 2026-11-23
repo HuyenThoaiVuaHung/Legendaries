@@ -1,5 +1,5 @@
 import { randomBytes, randomInt } from 'crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { Server } from 'socket.io';
 import { ServerConfig } from '../config';
@@ -127,11 +127,18 @@ export class RoomRegistry {
       code = typeable(ROOM_CODE_LENGTH);
     } while (this.idByCode.has(code));
 
+    const used = new Set<string>();
+    const uniqueTypeable = (len: number): string => {
+      let s: string;
+      do { s = typeable(len); } while (used.has(s));
+      used.add(s);
+      return s;
+    };
     const secrets: RoomSecrets = {
       admin: randomBytes(ADMIN_SECRET_BYTES).toString('base64url'),
-      mc: typeable(MC_SECRET_LENGTH),
-      player: typeable(PLAYER_SECRET_LENGTH),
-      spectator: typeable(MC_SECRET_LENGTH),
+      mc: uniqueTypeable(MC_SECRET_LENGTH),
+      players: Array.from({ length: PLAYER_COUNT }, () => uniqueTypeable(PLAYER_SECRET_LENGTH)),
+      spectator: uniqueTypeable(MC_SECRET_LENGTH),
     };
     const createdAt = Date.now();
     const meta: RoomMeta = {
@@ -141,7 +148,6 @@ export class RoomRegistry {
       spectatorMode: 'open',
       listed: false,
       links: [],
-      seats: Array(PLAYER_COUNT).fill(null),
       rules: loadGameRules(this.config.rules),
       createdAt,
       lastActiveAt: createdAt,
@@ -156,8 +162,11 @@ export class RoomRegistry {
   saveMeta(room: Room): void {
     if (!room.meta) return;
     const dir = this.roomDir(room.id);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, ROOM_META_FILE), JSON.stringify(room.meta, null, 2));
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = join(dir, ROOM_META_FILE);
+    const tmp = `${target}.tmp`;
+    writeFileSync(tmp, JSON.stringify(room.meta, null, 2), { mode: 0o600 });
+    renameSync(tmp, target);
     this.lastTouchPersisted.set(room.id, Date.now());
   }
 
@@ -267,15 +276,24 @@ export class RoomRegistry {
       const metaPath = join(this.roomDir(entry.name), ROOM_META_FILE);
       if (!existsSync(metaPath)) continue;
       try {
-        const raw = JSON.parse(readFileSync(metaPath, 'utf8')) as RoomMeta;
+        const raw = JSON.parse(readFileSync(metaPath, 'utf8')) as RoomMeta & { seats?: unknown; secrets: Partial<RoomSecrets> & { player?: string } };
+        const rawPlayers = Array.isArray(raw.secrets?.players) && raw.secrets.players.length === PLAYER_COUNT
+          ? raw.secrets.players
+          : Array.from({ length: PLAYER_COUNT }, () => typeable(PLAYER_SECRET_LENGTH));
         const meta: RoomMeta = {
-          ...raw,
+          code: raw.code,
+          ownerAccountId: raw.ownerAccountId,
+          createdAt: raw.createdAt,
           lastActiveAt: raw.lastActiveAt ?? raw.createdAt,
           spectatorMode: raw.spectatorMode ?? 'open',
           listed: raw.listed ?? false,
           links: raw.links ?? [],
-          secrets: { ...raw.secrets, spectator: raw.secrets.spectator ?? typeable(MC_SECRET_LENGTH) },
-          seats: Array.from({ length: PLAYER_COUNT }, (_, i) => raw.seats?.[i] ?? null),
+          secrets: {
+            admin: raw.secrets.admin ?? randomBytes(ADMIN_SECRET_BYTES).toString('base64url'),
+            mc: raw.secrets.mc ?? typeable(MC_SECRET_LENGTH),
+            players: rawPlayers,
+            spectator: raw.secrets.spectator ?? typeable(MC_SECRET_LENGTH),
+          },
           rules: loadGameRules(raw.rules as Partial<GameRules> | undefined),
         };
         const room = this.open(entry.name, meta);

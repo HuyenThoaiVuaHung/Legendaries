@@ -152,6 +152,7 @@ export function createAccountRoutes(deps: ApiDeps, accounts: AccountStore): Rout
       rooms: rooms.ownedBy(accountId).map((room) => ({
         roomId: room.id,
         code: room.meta!.code,
+        name: room.store.getMatch().matchName,
         createdAt: room.meta!.createdAt,
       })),
     };

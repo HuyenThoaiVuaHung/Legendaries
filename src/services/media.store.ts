@@ -2,8 +2,8 @@ import { randomBytes } from 'crypto';
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path';
 
-/** 3 random bytes = 6-char hex prefix keeping uploaded names collision-free. */
-const RANDOM_PREFIX_BYTES = 3;
+/** 16 random bytes = 32-char hex prefix making uploaded/imported media URLs unguessable. */
+const RANDOM_PREFIX_BYTES = 16;
 /** Used when sanitizing leaves nothing usable of the original name. */
 const FALLBACK_FILE_NAME = 'file';
 /** Characters invalid on common filesystems, plus ASCII control characters. */

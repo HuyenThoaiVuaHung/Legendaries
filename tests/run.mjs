@@ -12,11 +12,13 @@ const results = new Map([
   ['e2e-legion', 'FAIL'],
   ['rooms-auth', 'FAIL'],
   ['rooms-api', 'FAIL'],
+  ['security-audit', 'FAIL'],
   ['rooms-auth persist-create', 'FAIL'],
   ['rooms-auth persist-verify', 'FAIL'],
   ['rooms-isolation', 'FAIL'],
   ['bank', 'FAIL'],
   ['unsafe trust proxy', 'FAIL'],
+  ['unsafe default secrets bind', 'FAIL'],
   ['limits', 'FAIL'],
   ['room-features', 'FAIL'],
 ]);
@@ -147,11 +149,19 @@ try {
 
   try {
     const port = await freePort();
-    const hostedEnv = { ...env, LEGENDARY_PORT: String(port), LEGENDARY_MULTIROOM: 'true', LEGENDARY_SERVERADMINS: 'opsadmin', LEGENDARY_SIGNUPRATELIMIT: '50' };
+    const hostedEnv = {
+      ...env,
+      LEGENDARY_PORT: String(port),
+      LEGENDARY_MULTIROOM: 'true',
+      LEGENDARY_BOOTSTRAPADMIN: 'opsadmin:ops-admin-pass-1',
+      LEGENDARY_SIGNUPRATELIMIT: '50',
+      LEGENDARY_ROOMCREATERATELIMIT: '50',
+    };
     await startServer(port, hostedEnv);
     const args = [String(port), roomsDir];
     await runSuite('rooms-auth', 'rooms-auth.mjs', args);
     await runSuite('rooms-api', 'rooms-api.mjs', args);
+    await runSuite('security-audit', 'security-audit.mjs', [String(port)]);
     await runSuite('bank', 'bank.mjs', args);
     const saved = await runSuite('rooms-auth persist-create', 'rooms-auth.mjs', [...args, 'persist-create'], { capture: true });
     await stopServer();
@@ -173,6 +183,16 @@ try {
     const result = await Promise.race([unsafe.done, new Promise((resolve) => setTimeout(() => resolve(null), 5000))]);
     if (!result) { unsafe.kill(); await unsafe.done; }
     if (result && typeof result.code === 'number' && result.code !== 0) results.set('unsafe trust proxy', 'PASS');
+  }
+
+  if (!interrupted) {
+    const port = await freePort();
+    const unsafeBind = startChild([join(repo, 'dist', 'index.js')], {
+      cwd: tempDir, env: { ...env, LEGENDARY_PORT: String(port), LEGENDARY_HOST: '0.0.0.0' }, stdio: 'ignore',
+    });
+    const result = await Promise.race([unsafeBind.done, new Promise((resolve) => setTimeout(() => resolve(null), 5000))]);
+    if (!result) { unsafeBind.kill(); await unsafeBind.done; }
+    if (result && typeof result.code === 'number' && result.code !== 0) results.set('unsafe default secrets bind', 'PASS');
   }
 
   try {

@@ -27,8 +27,8 @@ const call = async (path, { token, method = 'GET', body, form, ip } = {}) => {
   return { status: response.status, body: result };
 };
 const post = (path, body, token, ip) => call(path, { method: 'POST', body, token, ip });
-const connect = (token) => new Promise((resolve) => {
-  const s = io(base, { auth: { token }, reconnection: false, timeout: 4000, forceNew: true });
+const connect = (token, extra = {}) => new Promise((resolve) => {
+  const s = io(base, { auth: { ...(token ? { token } : {}), ...extra }, reconnection: false, timeout: 4000, forceNew: true });
   s.once('connect', () => resolve({ s, status: 'connected' }));
   s.once('connect_error', (error) => { s.close(); resolve({ s, status: error.message }); });
 });
@@ -44,7 +44,7 @@ check('host signup', host.status === 201, JSON.stringify(host));
 const created = await post('/api/rooms', undefined, host.body.token);
 check('create room', created.status === 201, JSON.stringify(created));
 const room = created.body;
-const player = await post('/api/rooms/join', { code: room.code, secret: room.secrets.player, username: 'LimitPlayer' }, undefined, '192.0.2.10');
+const player = await post('/api/rooms/join', { code: room.code, secret: room.secrets.players[0] }, undefined, '192.0.2.10');
 check('player joins', player.status === 200, JSON.stringify(player));
 const adminInfo = await call('/api/rooms/current', { token: room.token });
 const playerInfo = await call('/api/rooms/current', { token: player.body.token });
@@ -76,6 +76,8 @@ try {
   const replacement = await connect(room.token);
   sockets.push(replacement);
   check('socket slot is released on disconnect', replacement.status === 'connected', replacement.status);
+  const lobbyBlocked = await connect(undefined, { lobby: true });
+  check('lobby connections count against per-IP socket cap', lobbyBlocked.status === 'Too many connections', lobbyBlocked.status);
 
   for (const [path, body, label] of [
     ['/api/accounts/login', { username: host.body.username, password: 'wrong-password-123' }, 'login'],

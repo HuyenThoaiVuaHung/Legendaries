@@ -1,7 +1,8 @@
 import { Role } from '../contracts/api';
 import { PLAYER_COUNT } from '../game.rules';
+import { emitRoundUpdate, sanitizeChpQuestion } from '../services/round-view';
 import { NO_PLAYER } from '../state/game.state';
-import { HandlerContext, isAdmin } from './context';
+import { HandlerContext, isAdmin, isStaff, safeOn } from './context';
 
 // Sound-effect identifiers understood by the frontend (protocol vocabulary,
 // names kept from the old client). CHP reuses the KD buzz and VD verdict cues.
@@ -18,58 +19,71 @@ function resolvePlayerIndex(ctx: HandlerContext): number {
 }
 
 export function registerChpHandlers(ctx: HandlerContext): void {
-  const { io, socket, store, session, timer, rules } = ctx;
+  const { io, room, socket, store, session, timer, rules } = ctx;
   const chp = store.round('chp');
 
-  socket.on('broadcast-chp-question', (id: number) => {
-    // A fresh question resets everyone's tiebreak attempt.
+  safeOn(ctx, 'broadcast-chp-question', (id: unknown) => {
+    if (!isStaff(ctx)) return;
+    if (typeof id !== 'number' || !Number.isInteger(id) || id < 0) return;
     const data = chp.update((d) => {
       d.playedPlayers = Array(PLAYER_COUNT).fill(false);
     });
-    io.emit('update-chp-question', data.questions[id]);
+    session.chpTurnPlayerIndex = NO_PLAYER;
+    const q = data.questions[id];
+    session.chpCurrentQuestion = q ?? null;
+    if (!q) {
+      io.emit('update-chp-question', {});
+      return;
+    }
+    room.staffChannel.emit('update-chp-question', q);
+    room.publicChannel.emit('update-chp-question', sanitizeChpQuestion(q));
   });
 
-  socket.on('start-timer-chp', () => {
+  safeOn(ctx, 'start-timer-chp', () => {
+    if (!isStaff(ctx)) return;
+    session.chpBuzzerOpen = true;
     timer.startMainClock(rules.chpTurnSeconds);
     io.emit('unlock-button-chp');
   });
 
-  socket.on('get-turn-chp', () => {
-    if (session.chpTurnPlayerIndex !== NO_PLAYER) return; // first buzz wins
+  safeOn(ctx, 'get-turn-chp', () => {
+    if (!session.chpBuzzerOpen || !timer.isRunning()) return;
+    if (session.chpTurnPlayerIndex !== NO_PLAYER) return;
     const playerIndex = resolvePlayerIndex(ctx);
     if (playerIndex === NO_PLAYER) return;
-    if (chp.get().playedPlayers[playerIndex]) return; // one attempt each
+    if (chp.get().playedPlayers[playerIndex]) return;
 
     session.chpTurnPlayerIndex = playerIndex;
+    session.chpBuzzerOpen = false;
     io.emit('lock-button-chp');
     io.emit('play-sfx', SFX_GET_TURN);
     io.emit('got-turn-chp', playerIndex);
-    timer.togglePause(); // hold the clock while the player answers
+    timer.togglePause();
   });
 
-  socket.on('mark-correct-chp', () => {
+  safeOn(ctx, 'mark-correct-chp', () => {
     if (!isAdmin(ctx)) return;
     const holder = session.chpTurnPlayerIndex;
     if (holder === NO_PLAYER) return;
 
     io.emit('play-sfx', SFX_CORRECT);
     const match = store.updateMatch((m) => {
-      m.players[holder].score += rules.chpCorrectPoints;
+      if (m.players[holder]) m.players[holder].score += rules.chpCorrectPoints;
     });
     io.emit('update-match-data', match);
     session.chpTurnPlayerIndex = NO_PLAYER;
     io.emit('clear-turn-chp');
   });
 
-  socket.on('mark-wrong-chp', () => {
+  safeOn(ctx, 'mark-wrong-chp', () => {
     if (!isAdmin(ctx)) return;
     const holder = session.chpTurnPlayerIndex;
     if (holder === NO_PLAYER) return;
 
-    timer.togglePause(); // resume the clock for the remaining players
+    timer.togglePause();
     io.emit('play-sfx', SFX_WRONG);
+    session.chpBuzzerOpen = true;
     io.emit('unlock-button-chp');
-    // The player who just answered wrongly stays locked out.
     const holderSocketId = session.playerSocketIds[holder];
     if (holderSocketId) socket.nsp.to(holderSocketId).emit('lock-button-chp');
     chp.update((d) => {
@@ -79,20 +93,22 @@ export function registerChpHandlers(ctx: HandlerContext): void {
     io.emit('clear-turn-chp');
   });
 
-  // Admin "Xóa chuông": forget the buzzer turn and everyone's attempt, and
-  // reopen the buttons.
-  socket.on('clear-turn-chp', () => {
+  safeOn(ctx, 'clear-turn-chp', () => {
     if (!isAdmin(ctx)) return;
     const data = chp.update((d) => {
       d.playedPlayers = Array(PLAYER_COUNT).fill(false);
     });
     session.chpTurnPlayerIndex = NO_PLAYER;
-    io.emit('update-chp-data', data);
+    session.chpBuzzerOpen = true;
+    emitRoundUpdate(room, 'chp', data);
     io.emit('unlock-button-chp');
     io.emit('clear-turn-chp');
   });
 
-  socket.on('clear-question-chp', () => {
+  safeOn(ctx, 'clear-question-chp', () => {
+    if (!isStaff(ctx)) return;
+    session.chpCurrentQuestion = null;
+    session.chpTurnPlayerIndex = NO_PLAYER;
     io.emit('update-chp-question', {});
   });
 }

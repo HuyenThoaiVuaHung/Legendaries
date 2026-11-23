@@ -1,8 +1,9 @@
 import { Role } from '../contracts/api';
 import { KdQuestion } from '../contracts/game';
 import { LogLevel } from '../logger';
+import { sanitizeKdQuestion } from '../services/round-view';
 import { DecisionTimerOwner, NO_PLAYER } from '../state/game.state';
-import { HandlerContext, isAdmin } from './context';
+import { HandlerContext, isAdmin, isStaff, safeOn } from './context';
 
 // Sound-effect identifiers understood by the frontend (protocol vocabulary,
 // names kept from the old client).
@@ -17,8 +18,18 @@ function resolvePlayerIndex(ctx: HandlerContext): number {
   return ctx.session.playerIndexOf(ctx.socket.id);
 }
 
+function isKdQuestion(value: unknown): value is KdQuestion {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as KdQuestion).question === 'string' &&
+    typeof (value as KdQuestion).answer === 'string' &&
+    typeof (value as KdQuestion).type === 'string'
+  );
+}
+
 export function registerKdHandlers(ctx: HandlerContext): void {
-  const { io, socket, store, session, timer, log, rules } = ctx;
+  const { io, room, socket, store, session, timer, log, rules } = ctx;
   const kd = store.round('kd');
 
   const emitQuestionNumbers = (): void => {
@@ -43,17 +54,28 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     });
   };
 
-  socket.on('broadcast-kd-question', (question: KdQuestion) => {
-    socket.broadcast.emit('update-kd-question', question);
+  safeOn(ctx, 'broadcast-kd-question', (question: unknown) => {
+    if (!isStaff(ctx)) return;
+    if (!isKdQuestion(question)) return;
+    session.kdPreviousAnswer = session.kdCurrentQuestion?.answer || null;
+    session.kdCurrentQuestion = question;
+    session.kdTurnPlayerIndex = NO_PLAYER;
+    socket.to(`${room.id}:staff`).emit('update-kd-question', question);
+    socket.to(`${room.id}:public`).emit('update-kd-question', sanitizeKdQuestion(question));
   });
 
-  socket.on('clear-question-kd', () => {
-    socket.broadcast.emit('update-kd-question', {});
+  safeOn(ctx, 'clear-question-kd', () => {
+    if (!isStaff(ctx)) return;
+    session.kdPreviousAnswer = session.kdCurrentQuestion?.answer || null;
+    session.kdCurrentQuestion = null;
+    session.kdTurnPlayerIndex = NO_PLAYER;
+    socket.to(room.id).emit('update-kd-question', {});
   });
 
-  socket.on('get-turn-kd', () => {
+  safeOn(ctx, 'get-turn-kd', () => {
     const playerIndex = resolvePlayerIndex(ctx);
     if (playerIndex === NO_PLAYER) return;
+    if (kd.get().gamemode !== 'M' || !session.kdBuzzerOpen) return;
     if (session.kdTurnPlayerIndex !== NO_PLAYER) {
       // First buzz wins; late presses are only logged.
       log(`Player ${playerIndex} requested turn`);
@@ -62,26 +84,30 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     io.emit('play-sfx', SFX_GET_TURN);
     session.kdDecisionTimerOwner = DecisionTimerOwner.Player;
     session.kdTurnPlayerIndex = playerIndex;
+    session.kdBuzzerOpen = false;
     io.emit('disable-answer-button-kd');
     io.emit('player-got-turn-kd', playerIndex);
   });
 
-  socket.on('clear-turn-kd', () => {
+  safeOn(ctx, 'clear-turn-kd', () => {
+    if (!isStaff(ctx)) return;
     log('Cleared turn khoi dong');
     session.kdTurnPlayerIndex = NO_PLAYER;
+    session.kdBuzzerOpen = true;
     io.emit('clear-turn-player-kd');
     io.emit('enable-answer-button-kd');
   });
 
-  socket.on('clear-turn-kd-f', () => {
-    // The old server wrote `this.lastTurnId` here — a no-op bug; the intent
-    // (clear the turn without reopening the buzzers) is implemented properly.
+  safeOn(ctx, 'clear-turn-kd-f', () => {
+    if (!isStaff(ctx)) return;
     session.kdTurnPlayerIndex = NO_PLAYER;
+    session.kdBuzzerOpen = false;
     io.emit('clear-turn-player-kd');
   });
 
-  socket.on('correct-mark-kd', () => {
+  safeOn(ctx, 'correct-mark-kd', () => {
     if (!isAdmin(ctx)) return;
+    session.kdBuzzerOpen = true;
     io.emit('enable-answer-button-kd');
     session.kdCurrentQuestionNo += 1;
     log(`Current question no: ${session.kdCurrentQuestionNo}`);
@@ -110,14 +136,13 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     session.kdTurnPlayerIndex = NO_PLAYER;
   });
 
-  socket.on('wrong-mark-kd', () => {
+  safeOn(ctx, 'wrong-mark-kd', () => {
     if (!isAdmin(ctx)) return;
+    session.kdBuzzerOpen = true;
     io.emit('enable-answer-button-kd');
 
     if (kd.get().gamemode === 'M') {
       const holder = session.kdTurnPlayerIndex;
-      // No holder: skip the penalty but still advance the question and reset
-      // turn state below, as the old server did.
       if (holder === NO_PLAYER) log('wrong-mark-kd with no turn holder', LogLevel.Warn);
       else penalizePlayer(holder);
     }
@@ -130,19 +155,32 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     session.kdTurnPlayerIndex = NO_PLAYER;
   });
 
-  socket.on('stop-kd-sound', () => {
+  safeOn(ctx, 'stop-kd-sound', () => {
+    if (!isStaff(ctx)) return;
+    session.activeLoopSfx = null;
+    session.activeTimedSfx = null;
     io.emit('stop-kd-sound');
   });
 
-  socket.on('update-number-question-kd', (maxCount: number, currentNo: number) => {
+  safeOn(ctx, 'update-number-question-kd', (maxCount: unknown, currentNo: unknown) => {
+    if (!isStaff(ctx)) return;
+    if (typeof maxCount !== 'number' || !Number.isInteger(maxCount) || maxCount < 0) return;
+    if (typeof currentNo !== 'number' || !Number.isInteger(currentNo) || currentNo < 0) return;
     session.kdMaxQuestionCount = maxCount;
     session.kdCurrentQuestionNo = currentNo;
     emitQuestionNumbers();
   });
 
-  socket.on('start-turn-kd', (questionCount: number) => {
+  safeOn(ctx, 'start-turn-kd', (questionCount: unknown) => {
+    if (!isStaff(ctx)) return;
+    if (typeof questionCount !== 'number' || !Number.isInteger(questionCount) || questionCount < 0) return;
     session.kdCurrentQuestionNo = 0;
     session.kdMaxQuestionCount = questionCount;
+    session.kdCurrentQuestion = null;
+    session.kdPreviousAnswer = null;
+    session.kdTurnPlayerIndex = NO_PLAYER;
+    session.kdDecisionRemaining = 0;
+    session.kdBuzzerOpen = true;
     emitQuestionNumbers();
     io.emit('enable-answer-button-kd');
     io.emit('update-questions-number-kd', questionCount);
@@ -151,9 +189,12 @@ export function registerKdHandlers(ctx: HandlerContext): void {
   // Post-buzz decision window: rules.kdDecisionTicks × rules.decisionTickMs.
   // Expiry of either variant only plays the wrong cue; the admin marks the
   // answer or skips the question manually.
-  socket.on('start-3s-timer-kd', (isPlayerTimer: boolean) => {
+  safeOn(ctx, 'start-3s-timer-kd', (isPlayerTimer: unknown) => {
+    if (!isStaff(ctx)) return;
+    if (typeof isPlayerTimer !== 'boolean') return;
     if (session.kdDecisionCountdown !== undefined) clearInterval(session.kdDecisionCountdown);
     let counter = rules.kdDecisionTicks;
+    session.kdDecisionRemaining = counter;
     session.kdDecisionTimerOwner = isPlayerTimer
       ? DecisionTimerOwner.Player
       : DecisionTimerOwner.Admin;
@@ -161,23 +202,27 @@ export function registerKdHandlers(ctx: HandlerContext): void {
 
     const handle = setInterval(() => {
       counter -= 1;
+      session.kdDecisionRemaining = Math.max(counter, 0);
       io.emit('update-3s-timer-kd', counter, isPlayerTimer);
 
       if (isPlayerTimer) {
         if (session.kdDecisionTimerOwner === DecisionTimerOwner.None) {
-          // The admin marked the answer before the window ran out.
           clearInterval(handle);
-          if (timer.remainingSeconds() > 0) io.emit('enable-answer-button-kd');
+          session.kdDecisionRemaining = 0;
+          if (timer.remainingSeconds() > 0) {
+            session.kdBuzzerOpen = true;
+            io.emit('enable-answer-button-kd');
+          }
           session.kdTurnPlayerIndex = NO_PLAYER;
           io.emit('update-3s-timer-kd', 0, true);
           io.emit('update-3s-timer-kd', 0, false);
         } else if (counter === 0) {
-          // Window expired: the holder never answered — counts as wrong.
           clearInterval(handle);
-          if (timer.remainingSeconds() > 0) io.emit('enable-answer-button-kd');
-          // Expiry only signals the miss: the admin decides what happens next
-          // (score, next question, turn), so nothing is deducted, advanced or
-          // cleared here.
+          session.kdDecisionRemaining = 0;
+          if (timer.remainingSeconds() > 0) {
+            session.kdBuzzerOpen = true;
+            io.emit('enable-answer-button-kd');
+          }
           if (session.kdDecisionTimerOwner === DecisionTimerOwner.Player) {
             session.kdDecisionTimerOwner = DecisionTimerOwner.None;
             io.emit('update-match-data', store.getMatch());
@@ -187,15 +232,18 @@ export function registerKdHandlers(ctx: HandlerContext): void {
         }
       } else {
         if (counter === 0) {
-          // Note: like the old server, natural expiry of the admin variant
-          // leaves the decision owner set; 'stop-3s-timer-kd' clears it.
           clearInterval(handle);
-          // Same as the player variant: the admin advances the question.
-          if (timer.remainingSeconds() > 0) io.emit('enable-answer-button-kd');
+          session.kdDecisionRemaining = 0;
+          session.kdDecisionTimerOwner = DecisionTimerOwner.None;
+          if (timer.remainingSeconds() > 0) {
+            session.kdBuzzerOpen = true;
+            io.emit('enable-answer-button-kd');
+          }
           io.emit('play-sfx', SFX_WRONG);
           emitQuestionNumbers();
         } else if (session.kdDecisionTimerOwner !== DecisionTimerOwner.Admin) {
           clearInterval(handle);
+          session.kdDecisionRemaining = 0;
           io.emit('update-3s-timer-kd', 0, false);
         }
       }
@@ -203,7 +251,9 @@ export function registerKdHandlers(ctx: HandlerContext): void {
     session.kdDecisionCountdown = handle;
   });
 
-  socket.on('stop-3s-timer-kd', () => {
+  safeOn(ctx, 'stop-3s-timer-kd', () => {
+    if (!isStaff(ctx)) return;
     session.kdDecisionTimerOwner = DecisionTimerOwner.None;
+    session.kdDecisionRemaining = 0;
   });
 }

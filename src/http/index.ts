@@ -6,6 +6,7 @@
  * handlers act on `roomOf(req)` — the room named by the caller's token.
  */
 import express, { Express, Router } from 'express';
+import { Server } from 'socket.io';
 import { join, resolve } from 'path';
 import { readFileSync } from 'fs';
 import { ServerConfig } from '../config';
@@ -14,7 +15,7 @@ import { LogFn } from '../logger';
 import { RoomRegistry } from '../rooms/room.registry';
 import { AccountStore } from '../services/account.store';
 import { AuthService } from '../services/auth.service';
-import { BankStore } from '../services/bank.store';
+import { QuestionBankStore } from '../services/question-bank.store';
 import { createBankRoutes } from './bank.routes';
 import { createAccountRoutes } from './account.routes';
 import { createAuthRoutes } from './auth.routes';
@@ -26,6 +27,7 @@ import { createRoomRoutes } from './room.routes';
 
 /** Everything the REST layer may touch, wired once in the composition root. */
 export interface ApiDeps {
+  io: Server;
   /** Per-request state (store, media, channel…) comes from `roomOf(req)`. */
   rooms: RoomRegistry;
   auth: AuthService;
@@ -52,7 +54,7 @@ export function createApiRouter(deps: ApiDeps): Router {
   if (multiRoom) {
     // Hosted: host accounts + rooms; the legacy secret login does not exist.
     router.use(createAccountRoutes(deps, deps.accounts));
-    const bank = new BankStore(deps.config.bankDir, deps.config.bankMaxItemsPerAccount, deps.config.bankMaxBytesPerAccount);
+    const bank = new QuestionBankStore(deps.config.bankDir, deps.config.bankMaxItemsPerAccount, deps.config.bankMaxBytesPerAccount, deps.config.bankMediaStorage);
     router.use(createBankRoutes(deps, bank));
     router.use(createRoomRoutes(deps, deps.accounts, bank));
   } else {

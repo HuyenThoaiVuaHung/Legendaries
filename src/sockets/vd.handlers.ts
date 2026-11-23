@@ -1,6 +1,7 @@
 import { Role } from '../contracts/api';
+import { emitRoundUpdate, sanitizeVdQuestion } from '../services/round-view';
 import { NO_PLAYER } from '../state/game.state';
-import { HandlerContext, isAdmin } from './context';
+import { HandlerContext, isAdmin, isStaff, safeOn } from './context';
 
 /** Protocol sentinel the admin client sends to clear the current question. */
 const CLEAR_QUESTION_ID = -1;
@@ -14,10 +15,18 @@ function resolvePlayerIndex(ctx: HandlerContext): number {
 }
 
 export function registerVdHandlers(ctx: HandlerContext): void {
-  const { io, socket, store, session, log, rules } = ctx;
+  const { io, room, store, session, log, rules } = ctx;
   const vd = store.round('vd');
 
-  socket.on('broadcast-vd-question', (id: number) => {
+  safeOn(ctx, 'broadcast-vd-question', (id: unknown) => {
+    if (!isStaff(ctx)) return;
+    if (typeof id !== 'number' || !Number.isInteger(id)) return;
+    session.vdHopeStarPenalized = false;
+    session.vdStealWindowOpen = false;
+    session.vdStealRemaining = 0;
+    session.vdStealingPlayerIndex = NO_PLAYER;
+    const resetVideo = session.resetVideoPlayback('vd');
+    io.emit('video-state', { target: 'vd', state: resetVideo, serverTime: Date.now() });
     if (id === CLEAR_QUESTION_ID) {
       session.vdCurrentQuestion = undefined;
       io.emit('update-vedich-question', undefined);
@@ -25,19 +34,25 @@ export function registerVdHandlers(ctx: HandlerContext): void {
         const data = vd.update((d) => {
           d.hopeStarActive = false;
         });
-        io.emit('update-vedich-data', data);
+        emitRoundUpdate(room, 'vd', data);
       }
       return;
     }
     const data = vd.get();
-    session.vdCurrentQuestion = data.questionPools[data.activePlayerIndex]?.[id];
-    io.emit('update-vedich-question', session.vdCurrentQuestion);
+    const q = data.questionPools[data.activePlayerIndex]?.[id];
+    session.vdCurrentQuestion = q;
+    if (!q) {
+      io.emit('update-vedich-question', undefined);
+      return;
+    }
+    room.staffChannel.emit('update-vedich-question', q);
+    room.publicChannel.emit('update-vedich-question', sanitizeVdQuestion(q));
   });
 
-  // Legacy payload note: the `id` argument of the marking events is the
-  // Payload is a 0-based player index, like every other new-contract event.
-  socket.on('mark-correct-vd', (playerIndex: number, value: number) => {
+  safeOn(ctx, 'mark-correct-vd', (playerIndex: unknown, value: unknown) => {
     if (!isAdmin(ctx)) return;
+    if (typeof playerIndex !== 'number' || !Number.isInteger(playerIndex)) return;
+    if (typeof value !== 'number' || !Number.isFinite(value)) return;
     const data = vd.get();
     const stealerIndex = session.vdStealingPlayerIndex;
 
@@ -45,21 +60,19 @@ export function registerVdHandlers(ctx: HandlerContext): void {
       const player = m.players[playerIndex];
       if (!player) return;
       if (data.hopeStarActive && stealerIndex === NO_PLAYER) {
-        // Hope star: the owner answered correctly, stakes are doubled.
         const gained = value * rules.vdHopeStarMultiplier;
         player.score += gained;
         log(`Player ${player.name} got ${gained} points`);
       } else if (stealerIndex !== NO_PLAYER) {
-        // A stealer answered correctly: they gain the value and the
-        // question's owner loses it — unless the hope star already made
-        // the owner pay up front when the steal window opened.
         player.score += value;
         log(`Player ${player.name} got ${value} points`);
         if (!data.hopeStarActive) {
           const owner = m.players[data.activePlayerIndex];
-          const lost = Math.min(value, Math.max(owner.score, 0));
-          owner.score -= lost;
-          log(`Player ${owner.name} lost ${lost} points`);
+          if (owner) {
+            const lost = Math.min(value, Math.max(owner.score, 0));
+            owner.score -= lost;
+            log(`Player ${owner.name} lost ${lost} points`);
+          }
         }
       } else {
         player.score += value;
@@ -71,19 +84,23 @@ export function registerVdHandlers(ctx: HandlerContext): void {
       d.hopeStarActive = false;
     });
     session.vdStealingPlayerIndex = NO_PLAYER;
-    io.emit('update-vedich-data', updated);
+    session.vdStealWindowOpen = false;
+    session.vdHopeStarPenalized = false;
+    emitRoundUpdate(room, 'vd', updated);
     io.emit('update-match-data', match);
     io.emit('clear-stealing-player');
   });
 
-  socket.on('mark-incorrect-vd', (playerIndex: number, value: number) => {
+  safeOn(ctx, 'mark-incorrect-vd', (playerIndex: unknown, value: unknown) => {
     if (!isAdmin(ctx)) return;
+    if (typeof playerIndex !== 'number' || !Number.isInteger(playerIndex)) return;
+    if (typeof value !== 'number' || !Number.isFinite(value)) return;
 
     const match = store.updateMatch((m) => {
       const player = m.players[playerIndex];
       if (!player) return;
       const lost = value / rules.vdWrongPenaltyDivisor;
-      const deducted = Math.min(lost, Math.max(player.score, 0)); // never below 0
+      const deducted = Math.min(lost, Math.max(player.score, 0));
       player.score -= deducted;
       log(`Player ${player.name} lost ${deducted} points`);
     });
@@ -92,40 +109,49 @@ export function registerVdHandlers(ctx: HandlerContext): void {
       d.hopeStarActive = false;
     });
     session.vdStealingPlayerIndex = NO_PLAYER;
-    io.emit('update-vedich-data', updated);
+    session.vdStealWindowOpen = false;
+    session.vdHopeStarPenalized = false;
+    emitRoundUpdate(room, 'vd', updated);
     io.emit('update-match-data', match);
     io.emit('clear-stealing-player');
   });
 
-  socket.on('player-steal-question', () => {
-    if (session.vdStealingPlayerIndex !== NO_PLAYER) return; // first press wins
+  safeOn(ctx, 'player-steal-question', () => {
+    if (!session.vdStealWindowOpen) return;
+    if (session.vdStealingPlayerIndex !== NO_PLAYER) return;
     const playerIndex = resolvePlayerIndex(ctx);
     if (playerIndex === NO_PLAYER) return;
+    if (playerIndex === vd.get().activePlayerIndex) return;
     io.emit('lock-button-vd');
     session.vdStealingPlayerIndex = playerIndex;
-    session.vdStealWindowOpen = false; // aborts the running countdown
+    session.vdStealWindowOpen = false;
     io.emit('player-steal-question', playerIndex);
   });
 
-  socket.on('reset-stealing-player', () => {
+  safeOn(ctx, 'reset-stealing-player', () => {
+    if (!isAdmin(ctx)) return;
     session.vdStealingPlayerIndex = NO_PLAYER;
     io.emit('clear-stealing-player');
   });
 
-  socket.on('vd-play-video', () => {
+  safeOn(ctx, 'vd-play-video', () => {
+    if (!isStaff(ctx)) return;
+    const now = Date.now();
+    const state = session.applyVideoControl('vd', { target: 'vd', action: 'toggle' }, now);
+    io.emit('video-state', { target: 'vd', state, serverTime: now });
     io.emit('vd-play-video');
   });
 
-  socket.on('start-5s-countdown-vd', () => {
+  safeOn(ctx, 'start-5s-countdown-vd', () => {
+    if (!isStaff(ctx)) return;
     let counter = rules.vdStealTicks;
+    session.vdStealRemaining = counter;
     session.vdStealWindowOpen = true;
     io.emit('unlock-button-vd');
 
     const data = vd.get();
-    if (data.hopeStarActive && session.vdCurrentQuestion !== undefined) {
-      // Hope-star pre-penalty: the owner stakes the question's value the
-      // moment the steal window opens (a later correct answer pays back
-      // double, netting +value).
+    if (data.hopeStarActive && session.vdCurrentQuestion !== undefined && !session.vdHopeStarPenalized) {
+      session.vdHopeStarPenalized = true;
       const staked = session.vdCurrentQuestion.value;
       const match = store.updateMatch((m) => {
         const owner = m.players[data.activePlayerIndex];
@@ -133,7 +159,7 @@ export function registerVdHandlers(ctx: HandlerContext): void {
         owner.score -= staked;
         log(`Player ${owner.name} lost ${staked} points`);
       });
-      io.emit('update-vedich-data', data);
+      emitRoundUpdate(room, 'vd', data);
       io.emit('update-match-data', match);
     }
 
@@ -141,11 +167,13 @@ export function registerVdHandlers(ctx: HandlerContext): void {
     if (session.vdStealCountdown !== undefined) clearInterval(session.vdStealCountdown);
     const handle = setInterval(() => {
       counter -= 1;
+      session.vdStealRemaining = Math.max(counter, 0);
       io.emit('update-5s-countdown-vd', counter);
       if (counter <= 0 || !session.vdStealWindowOpen) {
         clearInterval(handle);
         if (session.vdStealCountdown === handle) session.vdStealCountdown = undefined;
         session.vdStealWindowOpen = false;
+        session.vdStealRemaining = 0;
         io.emit('update-5s-countdown-vd', 0);
         io.emit('lock-button-vd');
       }

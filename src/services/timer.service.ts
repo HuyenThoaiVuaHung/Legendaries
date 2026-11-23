@@ -17,6 +17,7 @@ import { MatchStore } from '../state/match.store';
 export class TimerService {
   private running = false;
   private remaining = 0;
+  private maxSeconds = 0;
   private tickHandle?: NodeJS.Timeout;
   private delayHandle?: NodeJS.Timeout;
 
@@ -24,15 +25,19 @@ export class TimerService {
     private readonly io: RoomChannel,
     private readonly store: MatchStore,
     private readonly rules: GameRules,
+    private readonly onFinish?: () => void,
   ) {}
 
   /**
    * Start (or restart) the main clock. A clock that is already running or
    * pending is silently superseded — no stop events are emitted for it.
    */
-  startMainClock(seconds: number, options?: { startDelayMs?: number }): void {
+  startMainClock(seconds: number, options?: { startDelayMs?: number; preserveMax?: boolean }): void {
     this.clearHandles();
     this.running = false;
+    if (!options?.preserveMax || this.maxSeconds <= 0) {
+      this.maxSeconds = seconds;
+    }
     const delayMs = options?.startDelayMs ?? 0;
     if (delayMs > 0) {
       this.delayHandle = setTimeout(() => {
@@ -69,7 +74,7 @@ export class TimerService {
       this.store.updateMatch((match) => {
         match.pausedTimerSeconds = 0;
       });
-      this.startMainClock(paused);
+      this.startMainClock(paused, { preserveMax: true });
     }
   }
 
@@ -77,6 +82,7 @@ export class TimerService {
   dispose(): void {
     this.clearHandles();
     this.running = false;
+    this.maxSeconds = 0;
   }
 
   isRunning(): boolean {
@@ -91,6 +97,18 @@ export class TimerService {
   remainingSeconds(): number {
     if (this.running) return this.remaining;
     return this.store.getMatch().pausedTimerSeconds;
+  }
+
+  snapshot(): { running: boolean; remaining: number; maxSeconds: number; paused: boolean } {
+    const pausedSeconds = this.store.getMatch().pausedTimerSeconds;
+    const paused = !this.running && pausedSeconds > 0;
+    const remaining = this.running ? this.remaining : pausedSeconds;
+    return {
+      running: this.running,
+      remaining,
+      maxSeconds: this.running || paused ? Math.max(this.maxSeconds, remaining) : 0,
+      paused,
+    };
   }
 
   private run(seconds: number): void {
@@ -113,6 +131,10 @@ export class TimerService {
     this.clearHandles();
     this.running = false;
     this.remaining = 0;
+    if (this.store.getMatch().pausedTimerSeconds === 0) {
+      this.maxSeconds = 0;
+    }
+    this.onFinish?.();
     this.io.emit('update-clock', 0);
     this.io.emit('lock-button-chp');
     this.io.emit('disable-answer-button-kd');

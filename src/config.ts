@@ -1,9 +1,12 @@
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { GameRules, loadGameRules } from './game.rules';
+import type { BankMediaMode } from './services/bank-media-storage';
 
 export interface ServerConfig {
   port: number;
+  /** Interface address to bind. Single-venue defaults to 127.0.0.1 (loopback). */
+  host: string;
   /** One secret per player, in player-index order. */
   playerSecrets: string[];
   adminSecret: string;
@@ -33,13 +36,19 @@ export interface ServerConfig {
   assetsOverrideDir: string;
   saveLog: boolean;
   uploadLimitBytes: number;
+  /** Optional separate origin (e.g. https://media.example.com) for serving untrusted media. */
+  mediaOrigin?: string;
   /**
    * Hosted mode (VPS): rooms + host accounts on, the legacy secret login and
    * the default room off. Off (default): one venue, exactly as before.
    */
   multiRoom: boolean;
-  /** Host usernames allowed to change server-wide defaults (multiRoom). */
+  /** Deprecated username list; ignored for authorization (use serverAdminIds / bootstrapAdmin). */
   serverAdmins: string[];
+  /** Stable account IDs authorized to change server-wide branding (multiRoom). */
+  serverAdminIds: string[];
+  /** Optional operator account provisioned at startup and granted server-wide branding authority. */
+  bootstrapAdmin?: { username: string; password: string };
   /**
    * Express 'trust proxy': false (default), a hop count, or address/subnet
    * names ('loopback', '10.0.0.0/8'). `true` is refused: it would trust any
@@ -64,6 +73,7 @@ export interface ServerConfig {
   sessionMaxTtlSeconds: number;
   accountsPath: string;
   bankDir: string;
+  bankMediaStorage: BankMediaMode;
   bankMaxItemsPerAccount: number;
   bankMaxBytesPerAccount: number;
   maxRoomsPerAccount: number;
@@ -132,9 +142,20 @@ export function loadConfig(): ServerConfig {
   };
   const num = (key: string, fallback: number): number =>
     Number(process.env[`LEGENDARY_${key.toUpperCase()}`] ?? fileConfig[key] ?? fallback);
+  const bankMediaStorage = str('bankMediaStorage', 'file');
+  if (bankMediaStorage !== 'file' && bankMediaStorage !== 'sqlite') {
+    throw new Error('LEGENDARY_BANKMEDIASTORAGE must be file or sqlite');
+  }
+
+  const multiRoom = bool('multiRoom', DEFAULTS.multiRoom);
+  const rawMediaOrigin =
+    process.env['LEGENDARY_MEDIAORIGIN'] ??
+    (typeof fileConfig['mediaOrigin'] === 'string' ? fileConfig['mediaOrigin'] : undefined);
+  const mediaOrigin = rawMediaOrigin ? rawMediaOrigin.trim().replace(/\/+$/, '') : undefined;
 
   return {
     port: num('port', DEFAULTS.port),
+    host: str('host', multiRoom ? '0.0.0.0' : '127.0.0.1'),
     playerSecrets: (fileConfig['playerSecrets'] as string[]) ?? [...DEFAULTS.playerSecrets],
     adminSecret: str('adminSecret', DEFAULTS.adminSecret),
     mcSecret: str('mcSecret', DEFAULTS.mcSecret),
@@ -156,11 +177,19 @@ export function loadConfig(): ServerConfig {
     assetsOverrideDir: str('assetsOverrideDir', DEFAULTS.assetsOverrideDir),
     saveLog: Boolean(fileConfig['saveLog'] ?? DEFAULTS.saveLog),
     uploadLimitBytes: num('uploadLimitMb', DEFAULTS.uploadLimitMb) * BYTES_PER_MB,
-    multiRoom: bool('multiRoom', DEFAULTS.multiRoom),
+    ...(mediaOrigin ? { mediaOrigin } : {}),
+    multiRoom,
     serverAdmins:
       process.env['LEGENDARY_SERVERADMINS']?.split(',').map((name) => name.trim()).filter(Boolean) ??
       (fileConfig['serverAdmins'] as string[] | undefined) ??
       [],
+    serverAdminIds:
+      process.env['LEGENDARY_SERVERADMINIDS']?.split(',').map((id) => id.trim()).filter(Boolean) ??
+      (fileConfig['serverAdminIds'] as string[] | undefined) ??
+      [],
+    bootstrapAdmin: parseBootstrapAdmin(
+      process.env['LEGENDARY_BOOTSTRAPADMIN'] ?? fileConfig['bootstrapAdmin'],
+    ),
     trustProxy: parseTrustProxy(process.env['LEGENDARY_TRUSTPROXY'] ?? fileConfig['trustProxy']),
     maxSocketsPerIp: num('maxSocketsPerIp', DEFAULTS.maxSocketsPerIp),
     maxSpectatorsPerRoom: num('maxSpectatorsPerRoom', DEFAULTS.maxSpectatorsPerRoom),
@@ -174,6 +203,7 @@ export function loadConfig(): ServerConfig {
     sessionMaxTtlSeconds: num('sessionMaxTtlSeconds', DEFAULTS.sessionMaxTtlSeconds),
     accountsPath: str('accountsPath', DEFAULTS.accountsPath),
     bankDir: str('bankDir', DEFAULTS.bankDir),
+    bankMediaStorage,
     bankMaxItemsPerAccount: num('bankMaxItemsPerAccount', DEFAULTS.bankMaxItemsPerAccount),
     bankMaxBytesPerAccount: num('bankMaxBytesPerAccount', DEFAULTS.bankMaxBytesPerAccount),
     maxRoomsPerAccount: num('maxRoomsPerAccount', DEFAULTS.maxRoomsPerAccount),
@@ -190,6 +220,35 @@ export function usesDefaultSecrets(config: ServerConfig): boolean {
     config.mcSecret === DEFAULTS.mcSecret ||
     config.playerSecrets.some((secret) => (DEFAULTS.playerSecrets as readonly string[]).includes(secret))
   );
+}
+
+/** True when `host` resolves only to the local machine (loopback). */
+export function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return (
+    normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === 'localhost' ||
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(normalized)
+  );
+}
+
+function parseBootstrapAdmin(raw: unknown): { username: string; password: string } | undefined {
+  if (!raw) return undefined;
+  if (typeof raw === 'string') {
+    const sep = raw.indexOf(':');
+    if (sep <= 0 || sep === raw.length - 1) {
+      throw new Error('LEGENDARY_BOOTSTRAPADMIN must be formatted as "username:password"');
+    }
+    return { username: raw.slice(0, sep).trim(), password: raw.slice(sep + 1) };
+  }
+  if (typeof raw === 'object' && raw !== null) {
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj['username'] === 'string' && typeof obj['password'] === 'string') {
+      return { username: obj['username'].trim(), password: obj['password'] };
+    }
+  }
+  throw new Error('Invalid bootstrapAdmin configuration');
 }
 
 /**

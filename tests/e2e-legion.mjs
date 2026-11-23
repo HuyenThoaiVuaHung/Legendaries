@@ -106,13 +106,16 @@ const match = await fetch(`${base}/api/match`, { headers: auth }).then((r) => r.
 check('players imported', match.players?.[0]?.name === 'An' && match.players.length === 4, JSON.stringify(match.players));
 
 const tt = await fetch(`${base}/api/rounds/tt`, { headers: auth }).then((r) => r.json());
-check('tt round imported with image', tt.questions?.[0]?.questionImage === 'tt1.png', JSON.stringify(tt.questions?.[0]));
+const ttImg = tt.questions?.[0]?.questionImage;
+check('tt round imported with randomized image name', typeof ttImg === 'string' && ttImg !== 'tt1.png' && ttImg.endsWith('-tt1.png'), JSON.stringify(tt.questions?.[0]));
 
 const vcnv = await fetch(`${base}/api/rounds/vcnv`, { headers: auth }).then((r) => r.json());
 check('vcnv has 5 rows and obstacle', vcnv.questions?.length === 5 && vcnv.obstacle?.answer === 'HOANG SA', JSON.stringify(vcnv.obstacle));
 
-const importedMedia = await fetch(`${base}/media/tt/tt1.png`);
-check('imported media served', importedMedia.status === 200);
+const predictableMedia = await fetch(`${base}/media/tt/tt1.png`);
+check('predictable original filename is not served (404)', predictableMedia.status === 404, `status ${predictableMedia.status}`);
+const importedMedia = await fetch(`${base}/media/tt/${encodeURIComponent(ttImg)}`);
+check('imported media served at randomized URL', importedMedia.status === 200);
 
 // --- .legion export -------------------------------------------------------
 const exported = await fetch(`${base}/api/match/export-legion`, { headers: auth });
@@ -123,6 +126,59 @@ if (exportOk) {
   exportOk = outZip.getEntries().some((e) => e.entryName === 'editorData.json');
 }
 check('.legion export is a zip with editorData.json', exportOk, `status ${exported.status}, ${exportBuf.length}b`);
+
+// --- 5-piece VCNV obstacle ingest + protected reveal + export round-trip ---
+const fivePieceZip = new AdmZip();
+const fivePieceNames = ['p0.png', 'p1.png', 'p2.png', 'p3.png', 'p4.png'];
+fivePieceZip.addFile(
+  'editorData.json',
+  Buffer.from(
+    JSON.stringify({
+      matchData: editorData.matchData,
+      questionBank: {
+        ...editorData.questionBank,
+        vcnv: {
+          cnv: 'TRUONG SA',
+          cnvMediaSrcNames: fivePieceNames,
+          questions: editorData.questionBank.vcnv.questions,
+        },
+      },
+    }),
+  ),
+);
+for (const name of fivePieceNames) fivePieceZip.addFile(`vcnv/${name}`, PNG);
+const fiveForm = new FormData();
+fiveForm.append('file', new Blob([fivePieceZip.toBuffer()], { type: 'application/zip' }), 'five-pieces.legion');
+const fiveImport = await fetch(`${base}/api/match/import-legion`, { method: 'POST', headers: auth, body: fiveForm });
+check('5-piece .legion import accepted', fiveImport.status === 200);
+
+const vcnv5 = await fetch(`${base}/api/rounds/vcnv`, { headers: auth }).then((r) => r.json());
+check(
+  '5-piece import populates imagePieceFiles and omits public imageFile',
+  Array.isArray(vcnv5.obstacle?.imagePieceFiles) &&
+    vcnv5.obstacle.imagePieceFiles.length === 5 &&
+    vcnv5.obstacle.imageFile === undefined,
+  JSON.stringify(vcnv5.obstacle),
+);
+
+const publicPieceLeak = await fetch(`${base}/media/vcnv/p0.png`);
+check('5-piece import does not expose pieces in public /media/vcnv', publicPieceLeak.status === 404, `status ${publicPieceLeak.status}`);
+
+const closedPieceViewer = await fetch(`${base}/api/media/obstacle/0`);
+check('unrevealed obstacle piece denied to viewer (403)', closedPieceViewer.status === 403, `status ${closedPieceViewer.status}`);
+
+const adminPiece = await fetch(`${base}/api/media/obstacle/0`, { headers: auth });
+check('admin can fetch unrevealed obstacle piece (200)', adminPiece.status === 200, `status ${adminPiece.status}`);
+
+const exported5 = await fetch(`${base}/api/match/export-legion`, { headers: auth });
+const outZip5 = new AdmZip(Buffer.from(await exported5.arrayBuffer()));
+const outData5 = JSON.parse(outZip5.getEntry('editorData.json').getData().toString('utf8'));
+const exportedNames5 = outData5.questionBank?.vcnv?.cnvMediaSrcNames ?? [];
+check(
+  '5-piece export preserves all 5 piece names and bundles them in vcnv/',
+  exportedNames5.length === 5 && exportedNames5.every((n) => outZip5.getEntry(`vcnv/${n}`)),
+  JSON.stringify(exportedNames5),
+);
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);
