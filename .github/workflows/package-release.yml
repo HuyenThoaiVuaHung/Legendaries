@@ -26,7 +26,7 @@ jobs:
       - name: Check out matching Legion tag
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/Legion
+          repository: ${{ github.repository_owner }}/Legions
           ref: v${{ inputs.version }}
           path: _release/Legion
 
@@ -78,7 +78,7 @@ jobs:
             "version": "$VERSION",
             "backend": { "repository": "$GITHUB_REPOSITORY", "commit": "$GITHUB_SHA" },
             "frontend": {
-              "repository": "${{ github.repository_owner }}/Legion",
+              "repository": "${{ github.repository_owner }}/Legions",
               "tag": "v$VERSION",
               "commit": "$(git -C "$FRONTEND_DIR" rev-parse HEAD)"
             },
