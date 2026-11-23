@@ -20,7 +20,7 @@
     "express-rate-limit": "^8.7.1",
     "multer": "^2.5.0",
     "proxy-addr": "^2.0.8",
-    "socket.io": "^4.7.5"
+    "socket.io": "^4.8.4"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.5",
