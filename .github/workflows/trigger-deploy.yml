@@ -10,6 +10,8 @@ permissions: {}
 jobs:
   trigger:
     runs-on: ubuntu-latest
+    # Skipped until the CROSS_REPO_TOKEN secret is added.
+    if: ${{ vars.DEPLOY_TRIGGER == 'on' }}
     steps:
       - name: Dispatch Legions deploy
         env:
